@@ -35,8 +35,10 @@ class ToolProfileTest(unittest.TestCase):
             )
         }
         self.assertEqual(decorated, ALL_TOOL_NAMES)
-        self.assertEqual(len(ALL_TOOL_NAMES), 104)
+        self.assertEqual(len(ALL_TOOL_NAMES), 108)
         self.assertIn("prepare_netlist_draft", ALL_TOOL_NAMES)
+        self.assertIn("read_schematic_image", ALL_TOOL_NAMES)
+        self.assertIn("build_schematic_from_plan", ALL_TOOL_NAMES)
         self.assertIn("resolve_component_requirements", ALL_TOOL_NAMES)
         self.assertIn("approve_component_resolution", ALL_TOOL_NAMES)
         self.assertIn("compile_executable_netlist", ALL_TOOL_NAMES)

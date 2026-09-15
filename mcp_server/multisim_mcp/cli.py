@@ -3115,7 +3115,219 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a JSON result envelope",
     )
+
+    schematic_read = subparsers.add_parser(
+        "schematic-read",
+        help="read a schematic drawn as a picture and report its layout",
+    )
+    schematic_read.add_argument("image", help="PNG/JPEG schematic export or scan")
+    schematic_read.add_argument(
+        "--output",
+        help="write the full analysis report as JSON to this path",
+    )
+    schematic_read.add_argument(
+        "--overlay",
+        help="render a PNG overlay of the recovered geometry over the source image",
+    )
+    schematic_read.add_argument(
+        "--dpi",
+        type=float,
+        help="export resolution of the image; the only unambiguous way to fix scale",
+    )
+    schematic_read.add_argument("--paper", help="paper size, e.g. A1 (portrait or landscape)")
+    schematic_read.add_argument(
+        "--page-width-mm",
+        type=float,
+        dest="page_width_mm",
+        help="physical page width in millimetres, overriding paper detection",
+    )
+    schematic_read.add_argument(
+        "--downscale",
+        type=int,
+        default=0,
+        help="analysis downscale factor (0 or 1 picks a memory-safe default)",
+    )
+    schematic_read.add_argument(
+        "--use-ocr",
+        action="store_true",
+        dest="use_ocr",
+        help="attempt OCR of label regions when a tesseract executable is available",
+    )
+    schematic_read.add_argument(
+        "--cluster-labels",
+        dest="cluster_labels",
+        help="JSON file mapping cluster id to label text, transcribed by a human or agent",
+    )
+    schematic_read.add_argument(
+        "--json",
+        dest="json_command",
+        action="store_true",
+        help="emit the full analysis report to stdout",
+    )
+
+    schematic_build = subparsers.add_parser(
+        "schematic-build",
+        help="write an .ms14 that reproduces a picture's layout from a plan",
+    )
+    schematic_build.add_argument("plan", help="reconstruction plan JSON from schematic-read")
+    schematic_build.add_argument("--netlist", required=True, help="SPICE netlist to build")
+    schematic_build.add_argument("--output", required=True, help="destination .ms14 path")
+    schematic_build.add_argument(
+        "--net-terminals",
+        dest="net_terminals",
+        help="JSON file mapping net name to its terminal [x, y] positions",
+    )
+    schematic_build.add_argument(
+        "--json",
+        dest="json_command",
+        action="store_true",
+        help="emit a JSON result envelope",
+    )
     return parser
+
+
+def _read_json_file(path: str, *, description: str) -> Any:
+    """Load a small JSON file, failing with a useful message."""
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"{description} does not exist: {source}")
+    if source.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError(f"{description} is larger than 8 MB: {source}")
+    try:
+        return json.loads(source.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{description} is not valid JSON: {exc}") from exc
+
+
+def _schematic_read_command(args: Any) -> dict[str, Any]:
+    """Analyse a raster schematic and optionally write the report and an overlay."""
+    from .schematic_image.analyze import analyze_schematic_image
+
+    cluster_labels = (
+        _read_json_file(args.cluster_labels, description="--cluster-labels file")
+        if args.cluster_labels
+        else None
+    )
+    if cluster_labels is not None and not isinstance(cluster_labels, dict):
+        raise ValueError("--cluster-labels must contain a JSON object")
+
+    report = analyze_schematic_image(
+        args.image,
+        downscale=max(1, int(args.downscale)) if args.downscale else 1,
+        dpi=args.dpi,
+        paper=args.paper,
+        page_width_mm=args.page_width_mm,
+        use_ocr=bool(args.use_ocr),
+        cluster_labels=cluster_labels,
+    )
+
+    written: dict[str, str] = {}
+    if args.output:
+        destination = Path(args.output).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        written["report"] = str(destination)
+    if args.overlay:
+        from .schematic_image.overlay import render_overlay
+        from .schematic_image.plan import ReconstructionPlan
+
+        plan = ReconstructionPlan.from_dict(report["plan"])
+        overlay = render_overlay(args.image, plan, args.overlay)
+        written["overlay"] = overlay.path
+    return {"report": report, "written": written}
+
+
+def _print_schematic_read(result: dict[str, Any]) -> None:
+    report = result["report"]
+    plan = report["plan"]
+    calibration = report["calibration"]
+    print(f"image          : {report['image']['path']}  {report['image']['size_px']}")
+    print(
+        f"scale          : {calibration['px_per_mil']:.5f} px/mil "
+        f"({calibration['method']}, paper {calibration['paper']})"
+    )
+    for warning in report.get("scale", {}).get("warnings", []):
+        print(f"scale note     : {warning}")
+    print(
+        f"components     : {plan['counts']['components']} "
+        f"(high {plan['stats']['symbols_high_confidence']}, "
+        f"medium {plan['stats']['symbols_medium_confidence']}, "
+        f"low {plan['stats']['symbols_low_confidence']})"
+    )
+    print(f"wires          : {plan['counts']['wires']} polylines")
+    print(f"junction dots  : {plan['counts']['junctions']}")
+    print(
+        f"labels         : {plan['stats']['labels_read']} read of "
+        f"{plan['stats']['label_regions']} located"
+    )
+    for key, path in result.get("written", {}).items():
+        print(f"{key:14s} : {path}")
+    for warning in plan.get("warnings", [])[:5]:
+        print(f"warning        : {warning}")
+
+
+def _schematic_build_command(args: Any) -> dict[str, Any]:
+    """Write an .ms14 that reproduces a plan's layout for a given netlist."""
+    from .schematic_builder import build_schematic
+    from .schematic_image.assemble import build_request_from_plan
+    from .schematic_image.plan import ReconstructionPlan
+
+    payload = _read_json_file(args.plan, description="plan file")
+    # Accept either the analysis report or a bare plan.
+    plan_payload = payload.get("plan") if isinstance(payload, dict) and "plan" in payload else payload
+    plan = ReconstructionPlan.from_dict(plan_payload)
+
+    netlist_path = Path(args.netlist).expanduser()
+    if not netlist_path.is_file():
+        raise FileNotFoundError(f"netlist does not exist: {netlist_path}")
+    netlist = netlist_path.read_text(encoding="utf-8-sig")
+
+    terminals: dict[str, list[tuple[float, float]]] | None = None
+    if args.net_terminals:
+        raw = _read_json_file(args.net_terminals, description="--net-terminals file")
+        if not isinstance(raw, dict):
+            raise ValueError("--net-terminals must contain a JSON object")
+        terminals = {
+            str(name): [(float(point[0]), float(point[1])) for point in points]
+            for name, points in raw.items()
+        }
+
+    request = build_request_from_plan(plan, terminals=terminals)
+
+    output = Path(args.output).expanduser()
+    if output.suffix.lower() != ".ms14":
+        raise ValueError("--output must end with .ms14")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite existing file: {output}")
+    xml_path = output.with_suffix(".xml")
+    if xml_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing file: {xml_path}")
+
+    build = build_schematic(
+        netlist,
+        xml_path,
+        probe_nets=[],
+        explicit_positions=request.positions,
+        explicit_routes=request.routes,
+    )
+    from .multisim_client import Ms14Codec
+
+    encoded = Ms14Codec().encode(str(xml_path), str(output))
+    validation = build.get("layout_validation", {})
+    return {
+        "schema_version": 1,
+        "success": True,
+        "ms14": str(output),
+        "xml": str(xml_path),
+        "encode": encoded,
+        "positions": len(request.positions),
+        "routes": len(request.routes),
+        "assignment": request.to_dict(),
+        "layout_validation": validation,
+        "warnings": list(request.warnings),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -3663,6 +3875,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(result["output_dir"])
+        return 0
+    if args.command == "schematic-read":
+        try:
+            result = _schematic_read_command(args)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            if json_output:
+                print(json.dumps({**_cli_error("schematic-read", exc)}, ensure_ascii=False))
+            else:
+                parser.error(str(exc))
+            return 2
+        if json_output:
+            print(json.dumps(result["report"], ensure_ascii=False, indent=2))
+        else:
+            _print_schematic_read(result)
+        return 0
+    if args.command == "schematic-build":
+        try:
+            result = _schematic_build_command(args)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            if json_output:
+                print(json.dumps({**_cli_error("schematic-build", exc)}, ensure_ascii=False))
+            else:
+                parser.error(str(exc))
+            return 2
+        if json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(result["ms14"])
+            for warning in result.get("warnings", []):
+                print(f"warning: {warning}", file=sys.stderr)
         return 0
     if args.command == "configure":
         try:

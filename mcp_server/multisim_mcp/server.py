@@ -2598,6 +2598,182 @@ def run_natural_common_emitter(text: str, output_dir: str, execute: bool = False
     return run(text, output_dir, execute=execute)
 
 
+@mcp.tool(com_serialized=False)
+def schematic_image_status() -> dict[str, Any]:
+    """Report whether reading a schematic from a picture is available here.
+
+    Never raises.  Image reconstruction needs numpy and Pillow; when they are
+    missing, ``available`` is false, ``missing`` names them, and
+    ``install_hint`` gives the exact command.  ``ocr`` reports whether a
+    tesseract executable was found, which decides if ``read_schematic_image``
+    can transcribe labels on its own instead of returning them for review.
+    """
+    from multisim_mcp.schematic_image import schematic_image_status as status
+
+    return status()
+
+
+@mcp.tool(com_serialized=False)
+def read_schematic_image(
+    image_path: str,
+    dpi: float | None = None,
+    paper: str | None = None,
+    page_width_mm: float | None = None,
+    downscale: int = 0,
+    use_ocr: bool = False,
+    cluster_labels: dict[str, str] | None = None,
+    box_labels: dict[str, str] | None = None,
+    kind_overrides: dict[str, str] | None = None,
+    refdes_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Read a schematic supplied as a picture and report its layout.
+
+    Accepts a PNG or JPEG export, scan or screenshot and returns the page scale,
+    every component it found with an explicit position in drawing units, the
+    vectorised wire graph, the located label regions, and a reconstruction
+    ``plan``. It never writes a schematic, never starts Multisim, and never
+    guesses silently: unread labels and ambiguous classifications are reported
+    in ``plan.warnings``.
+
+    Pass ``dpi`` whenever the export resolution is known. ISO A-series sheets
+    share one aspect ratio, so the drawing's scale cannot be recovered from the
+    image alone; without ``dpi`` a paper size is inferred and the assumption is
+    recorded. ``paper`` or ``page_width_mm`` pin it explicitly instead.
+
+    Labels are located deterministically but only read when a tesseract
+    executable is present. Otherwise supply ``cluster_labels`` (cluster id to
+    text) or ``box_labels`` (``"x0,y0,x1,y1"`` to text) after reviewing
+    ``labels.regions``, which is how an agent transcribes a sheet in a few dozen
+    decisions rather than hundreds.
+    """
+    from multisim_mcp.schematic_image.analyze import analyze_schematic_image
+
+    if not isinstance(image_path, str) or not image_path.strip():
+        raise ValueError("image_path must not be empty")
+    if downscale is not None and downscale < 0:
+        raise ValueError("downscale must be 0 (automatic) or a positive integer")
+    if dpi is not None and not 1.0 <= float(dpi) <= 100_000.0:
+        raise ValueError("dpi must be between 1 and 100000")
+
+    return analyze_schematic_image(
+        image_path,
+        downscale=max(1, int(downscale)) if downscale else 1,
+        dpi=None if dpi is None else float(dpi),
+        paper=paper,
+        page_width_mm=page_width_mm,
+        use_ocr=bool(use_ocr),
+        cluster_labels=cluster_labels,
+        box_labels=box_labels,
+        kind_overrides=kind_overrides,
+        refdes_overrides=refdes_overrides,
+    )
+
+
+@mcp.tool(com_serialized=False)
+def render_schematic_overlay(
+    image_path: str,
+    plan: dict[str, Any],
+    output_png: str,
+    max_width_px: int = 2600,
+) -> dict[str, Any]:
+    """Draw a reconstruction plan over its source picture as a review image.
+
+    Writes a PNG that shows recovered wires, junction dots, component boxes and
+    still-unread labels on top of the original drawing, so a reviewer can see at
+    a glance what was captured and what was missed. The claim that a
+    reconstruction is faithful is only meaningful if it can be inspected, and
+    this is that inspection. It does not modify the source image and does not
+    create or open a schematic.
+    """
+    from multisim_mcp.schematic_image.overlay import render_overlay
+    from multisim_mcp.schematic_image.plan import ReconstructionPlan
+
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be the reconstruction plan object")
+    if not 200 <= max_width_px <= 20000:
+        raise ValueError("max_width_px must be between 200 and 20000")
+    parsed = ReconstructionPlan.from_dict(plan)
+    return render_overlay(image_path, parsed, output_png, max_width_px=max_width_px).to_dict()
+
+
+@mcp.tool(com_serialized=False)
+def build_schematic_from_plan(
+    netlist: str,
+    plan: dict[str, Any],
+    output_ms14: str,
+    net_terminals: dict[str, list[list[float]]] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Write an .ms14 that reproduces a picture's layout for a given netlist.
+
+    ``plan`` is the reconstruction plan from ``read_schematic_image``. Every
+    component position in it is written literally, so the generated schematic
+    keeps the original drawing's placement instead of a heuristic grid.
+
+    ``net_terminals`` maps a net name to the drawing positions of the pins on
+    that net. Supplying it lets the recovered wire routes be attached to the
+    right nets; without it the component positions are still exact and the
+    wiring is autorouted. Nets whose recovered wire cannot be matched are listed
+    in ``assignment.warnings`` rather than connected on a guess.
+
+    This does not start Multisim and does not open the file; it writes the
+    ``.ms14`` and its source XML. Set ``overwrite`` to replace existing files.
+    """
+    from multisim_mcp.schematic_builder import build_schematic
+    from multisim_mcp.schematic_image.assemble import build_request_from_plan
+    from multisim_mcp.schematic_image.plan import ReconstructionPlan
+
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be the reconstruction plan object")
+    if not netlist.strip():
+        raise ValueError("netlist must not be empty")
+    parsed = ReconstructionPlan.from_dict(plan)
+
+    terminals: dict[str, list[tuple[float, float]]] | None = None
+    if net_terminals:
+        terminals = {}
+        for name, points in net_terminals.items():
+            cleaned: list[tuple[float, float]] = []
+            for point in points:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    raise ValueError(f"net {name!r} terminals must be [x, y] pairs")
+                cleaned.append((float(point[0]), float(point[1])))
+            terminals[str(name)] = cleaned
+
+    request = build_request_from_plan(parsed, terminals=terminals)
+
+    output = Path(output_ms14).expanduser()
+    if output.suffix.lower() != ".ms14":
+        raise ValueError("output_ms14 must end with .ms14")
+    xml_path = output.with_suffix(".xml")
+    for path in (output, xml_path):
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"refusing to overwrite existing file: {path}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    build = build_schematic(
+        netlist,
+        xml_path,
+        probe_nets=[],
+        explicit_positions=request.positions,
+        explicit_routes=request.routes,
+    )
+    encoded = codec.encode(str(xml_path), str(output))
+    return {
+        "schema_version": 1,
+        "success": True,
+        "maturity": "experimental",
+        "ms14": str(output),
+        "xml": str(xml_path),
+        "encode": encoded,
+        "positions_applied": len(request.positions),
+        "routes_applied": len(request.routes),
+        "assignment": request.to_dict(),
+        "layout_validation": build.get("layout_validation", {}),
+        "warnings": list(request.warnings),
+    }
+
+
 @mcp.tool()
 def create_schematic_from_netlist(
     netlist: str,

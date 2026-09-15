@@ -183,6 +183,12 @@ COM worker，服务重启后未完成任务会安全地重新排队。
   CSV、SVG 和 Markdown 报告。
 - 自动生成的原理图探针暂不作为实验数据来源；实验数据来自同一网表经 Multisim
   命令引擎执行的结果。
+- 从图片读取原理图（`read_schematic_image`）：恢复页面比例、逐器件显式坐标、
+  走线矢量图和标签区域，并可用 `build_schematic_from_plan` 把量得的布局原样写回
+  `.ms14`。比例尺不会静默猜测——ISO A 系列图纸长宽比相同，无法从形状区分 A4 与
+  A0，因此必须给出 `dpi`、`paper` 或 `page_width_mm`，否则报错而不是猜一个。详见
+  [`docs/SCHEMATIC_IMAGE_RECONSTRUCTION.md`](docs/SCHEMATIC_IMAGE_RECONSTRUCTION.md)。
+  该能力需要可选依赖，安装 `multisim-mcp[images]`。
 
 ## 快速开始
 

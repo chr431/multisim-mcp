@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -2884,18 +2885,69 @@ def _add_virtual_instrument_state(
     instruments_data.append(state)
 
 
+def _anchor_route(
+    prescribed: Sequence[Sequence[float]],
+    start: Mapping[str, Any],
+    end: Mapping[str, Any],
+) -> list[tuple[float, float]]:
+    """Return a measured polyline with its ends joined to the actual pins.
+
+    A route recovered from a picture is authoritative in the middle, but its
+    endpoints may be a grid step away from where the builder finally placed the
+    two pins.  Rectilinear stubs are therefore added at each end so the wire
+    still lands exactly on both ports and every segment stays axis-aligned.
+    """
+    points: list[tuple[float, float]] = [
+        (float(point[0]), float(point[1])) for point in prescribed
+    ]
+    start_point = (float(start["x"]), float(start["y"]))
+    end_point = (float(end["x"]), float(end["y"]))
+
+    if points[0] != start_point:
+        points.insert(0, (start_point[0], points[0][1]))
+        points.insert(0, start_point)
+    if points[-1] != end_point:
+        points.append((points[-1][0], end_point[1]))
+        points.append(end_point)
+
+    # Collapse duplicates and any segment that is not axis-aligned is left as
+    # drawn; the geometry validator reports it rather than silently rewriting it.
+    cleaned: list[tuple[float, float]] = []
+    for point in points:
+        if not cleaned or cleaned[-1] != point:
+            cleaned.append(point)
+    return cleaned
+
+
 def build_schematic(
     netlist: str,
     output_path: str | Path,
     template_path: str | Path | None = None,
     probe_nets: list[str] | None = None,
+    explicit_positions: Mapping[str, Sequence[float]] | None = None,
+    explicit_routes: Mapping[str, Sequence[Sequence[float]]] | None = None,
 ) -> dict[str, Any]:
     """Build an editable Multisim XML design from a simple SPICE netlist.
 
     ``probe_nets`` names the nets that should get voltage probes. When omitted,
     the last non-ground net is probed automatically. Set it to an empty list to
     disable probes.
+
+    ``explicit_positions`` maps a reference designator to an ``(x, y)`` drawing
+    position. Every entry is honoured verbatim and takes precedence over the
+    built-in layout profiles, which is what makes it possible to reproduce a
+    layout that was measured from a drawing rather than chosen heuristically.
+
+    ``explicit_routes`` maps a net name to a polyline (a sequence of ``(x, y)``
+    points) that is used as that net's wire route instead of the autorouter's
+    result. This is how a wire path recovered from a picture is reproduced
+    exactly.
     """
+    explicit_positions = dict(explicit_positions or {})
+    explicit_routes = {
+        str(name): [tuple(float(value) for value in point) for point in path]
+        for name, path in (explicit_routes or {}).items()
+    }
     parsed = parse_netlist(netlist)
     inductor_refs = {
         spec.refdes.lower() for spec in parsed.components if spec.kind == "L"
@@ -3022,7 +3074,13 @@ def build_schematic(
         rank = placement_rank[component_index]
         x = grid_origin_x + (rank % grid_columns) * grid_step_x
         y = grid_origin_y + (rank // grid_columns) * grid_step_y
-        if simple_profile:
+        explicit = explicit_positions.get(spec.refdes)
+        if explicit is not None:
+            # An explicitly requested position is honoured verbatim: it comes
+            # from a layout that was measured, not chosen, so no profile or grid
+            # heuristic may override it.
+            x, y = float(explicit[0]), float(explicit[1])
+        elif simple_profile:
             x, y = simple_profile['positions'][spec.refdes]
         elif opamp_profile:
             x, y = opamp_profile['positions'][spec.refdes]
@@ -3226,7 +3284,17 @@ def build_schematic(
             _clear(points)
             occupied = [segment for other, paths in net_wires.items() if other != name
                         for path in paths for segment in zip(path, path[1:])]
-            path = route_pins(start, end, routing_obstacles, occupied)
+            prescribed = explicit_routes.get(name)
+            if prescribed and len(prescribed) >= 2 and len(conns) == 2:
+                # A measured route: reproduce it exactly, but still anchor its
+                # ends on the two pin positions so the net stays connected.  A
+                # prescribed route describes one wire, so it is only applied to
+                # nets that are exactly one wire; a multi-drop net needs an
+                # explicit trunk-and-branch decomposition that the caller has
+                # not supplied, and misapplying it would emit overlapping wires.
+                path = _anchor_route(prescribed, start, end)
+            else:
+                path = route_pins(start, end, routing_obstacles, occupied)
             for px, py in path:
                 points.append(ET.Element("Item", {"X": f"{px:g}", "Y": f"{py:g}"}))
             modifier = wire.find("./ElectricalObject/ModifierInfo/Element")

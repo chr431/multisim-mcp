@@ -27,6 +27,15 @@ dependencies = [
     "typing-extensions>=4.13",
 ]
 
+[project.optional-dependencies]
+# Reading a schematic from a picture.  numpy is pinned below 2.0 only for the
+# 32-bit Windows interpreter this server must run on, where the 2.x wheels are
+# not published for every release; both 1.26 and 2.x work when available.
+images = [
+    "numpy>=1.24",
+    "Pillow>=10.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/yxy050208/multisim-mcp"
 Repository = "https://github.com/yxy050208/multisim-mcp"

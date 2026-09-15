@@ -32,10 +32,10 @@
     ],
     "bundle_path": "integrations/deepseek-harness",
     "tool_profiles": {
-      "core": 29,
-      "experiment": 81,
-      "optimization": 69,
-      "full": 104
+      "core": 33,
+      "experiment": 85,
+      "optimization": 73,
+      "full": 108
     },
     "skills": [
       "multisim-create-experiment",
