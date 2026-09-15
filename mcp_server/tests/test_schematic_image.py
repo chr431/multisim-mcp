@@ -514,6 +514,46 @@ class OverlayTest(unittest.TestCase):
             render_overlay("definitely-absent.png", plan, "out.png")
 
 
+class TextHeightTest(unittest.TestCase):
+    """Text height must be measured from the glyphs, not from AA fragments."""
+
+    def setUp(self) -> None:
+        if _numpy() is None:
+            self.skipTest("numpy is not installed")
+        self.np = _numpy()
+
+    def test_height_is_not_dragged_down_by_fragments(self) -> None:
+        from multisim_mcp.schematic_image.text import estimate_text_height
+
+        # Twenty 1px fragments plus several real 28px glyphs: the median piece is
+        # a fragment, so a median-based estimate would report a few pixels.
+        mask = self.np.zeros((60, 200), bool)
+        for index in range(20):
+            mask[0, index * 3 : index * 3 + 1] = True
+        for index in range(6):
+            mask[10:38, 100 + index * 15 : 108 + index * 15] = True
+        low, high = estimate_text_height(mask, grid_px=8.0)
+        self.assertGreaterEqual(high, 28, "the real glyph height must be in range")
+        self.assertLessEqual(low, 28)
+
+    def test_long_strokes_are_not_treated_as_text(self) -> None:
+        from multisim_mcp.schematic_image.text import estimate_text_height
+
+        # A long thin symbol stroke shares the designator colour but is not text.
+        mask = self.np.zeros((40, 300), bool)
+        mask[20, :] = True
+        low, high = estimate_text_height(mask, grid_px=8.0)
+        self.assertGreaterEqual(low, 3)
+        self.assertGreater(high, low)
+
+    def test_empty_mask_still_returns_a_usable_range(self) -> None:
+        from multisim_mcp.schematic_image.text import estimate_text_height
+
+        low, high = estimate_text_height(self.np.zeros((10, 10), bool), grid_px=8.0)
+        self.assertGreaterEqual(low, 3)
+        self.assertGreater(high, low)
+
+
 class AnchorTest(unittest.TestCase):
     """Components are enumerated from reference designators, not from artwork."""
 

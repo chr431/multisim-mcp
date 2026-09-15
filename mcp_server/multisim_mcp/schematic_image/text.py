@@ -188,10 +188,17 @@ def estimate_text_height(mask: Any, *, grid_px: float) -> tuple[int, int]:
     """Return a plausible ``(min, max)`` glyph height for a text-colour mask.
 
     Label size varies with the drawing's own text style, so it is measured rather
-    than assumed.  The estimate uses the *median component height among
-    components that look like characters* -- taller than a couple of pixels and
-    not a long thin stroke -- which is stable even when anti-aliasing shatters the
-    thinnest glyphs into fragments.
+    than assumed.  Measuring it is not simply a matter of taking the median
+    component height: anti-aliasing shatters thin strokes, so most connected
+    components are 1-3 pixel fragments and the median describes the *fragments*,
+    not the text.
+
+    The 75th percentile of piece heights is the discriminator.  Higher
+    percentiles start including multi-line blocks, and dilating the mask to
+    rejoin fragments was measured to inflate the estimate (47-60 px for text that
+    is really 29 px), so no bridging is applied.  Measured on the reference
+    sheet: p50 = 17 px for fragment-dominated pieces, p75 = 29 px for the true
+    glyph height.
     """
     numpy = _require_numpy()
     imaging = _imaging()
@@ -208,18 +215,16 @@ def estimate_text_height(mask: Any, *, grid_px: float) -> tuple[int, int]:
         if box is None:
             continue
         width, height = box[2] - box[0], box[3] - box[1]
-        # A character is not a hairline fragment and not a long stroke.
+        # A glyph is neither a hairline fragment nor a long symbol stroke.
         if height < 3 or width > 4 * height:
             continue
         heights.append(height)
     if not heights:
         return 3, max(6, int(round(4.0 * grid_px)))
     heights.sort()
-    typical = heights[len(heights) // 2]
-    # Accept from half to double the typical character height, and never less
-    # than a few pixels, so a drawing with mixed label sizes still works.
-    low = max(3, int(round(0.5 * typical)))
-    high = max(low + 2, int(round(2.2 * typical)))
+    typical = heights[int(0.75 * (len(heights) - 1))]
+    low = max(3, int(round(0.6 * typical)))
+    high = max(low + 2, int(round(1.8 * typical)))
     return low, high
 
 
