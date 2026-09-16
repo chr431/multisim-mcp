@@ -3197,6 +3197,32 @@ def build_schematic(
     if parsed.grounded:
         specs.append(ComponentSpec(kind="GND", refdes="0", nodes=["0"]))
 
+    # --- Refuse a layout whose names do not match the netlist.
+    #
+    # This is the silent failure that matters most for a measured layout. If the
+    # supplied positions name parts the netlist does not contain, every one of
+    # them is ignored, the parts are placed by the grid instead, and the sheet is
+    # then sized for the parts that were actually placed. The result is a
+    # plausible-looking file that quietly discarded the caller's work -- which is
+    # exactly what happened before this check existed: 30 measured positions were
+    # dropped and the sheet came out 960 units wide with the parts crammed into
+    # 3732 units of a drawing that should have been 11000 units across.
+    #
+    # Failing loudly is the only safe behaviour, because the caller cannot tell
+    # the difference by looking at the output.
+    if explicit_positions:
+        known = {spec.refdes for spec in specs}
+        unknown = sorted(set(explicit_positions) - known)
+        if unknown:
+            sample = ", ".join(unknown[:8])
+            more = f" (+{len(unknown) - 8} more)" if len(unknown) > 8 else ""
+            raise ValueError(
+                f"{len(unknown)} explicit position(s) name components the netlist "
+                f"does not contain: {sample}{more}. Nothing would be placed at those "
+                "positions. Check that the reference designators match, or rename the "
+                "netlist parts to match the drawing."
+            )
+
     # --- Local ground symbols, optionally. A schematic normally avoids running a
     # ground wire across the whole sheet by placing a small ground symbol at each
     # point that needs one; a real reconstruction attempt measured its ground run

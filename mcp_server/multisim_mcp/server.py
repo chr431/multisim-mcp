@@ -2694,8 +2694,10 @@ def review_schematic_session(
         replace a net's route with an explicit ``points`` polyline
     ``set-text``
         transcribe a label the analysis located but could not read
-    ``clear-warnings`` / ``overlay``
-        mark warnings reviewed, or redraw the review image
+    ``clear-warnings`` / ``overlay`` / ``check-netlist``
+        mark warnings reviewed, redraw the review image, or check that the plan's
+        reference designators match a netlist before building. ``check-netlist``
+        needs ``netlist`` in the ``value`` field.
 
     Positions and wire points are in Multisim storage units (1/96 inch). Use
     ``build_schematic_from_session`` to write the ``.ms14`` once the review is done.
@@ -2760,11 +2762,13 @@ def review_schematic_session(
         session.set_text(need("text", text), need("replacement", replacement))
     elif action == "clear-warnings":
         session.clear_warnings()
+    elif action == "check-netlist":
+        return session.check_against_netlist(need("value (the netlist text)", value))
     else:
         raise ValueError(
             f"unknown action {action!r}; use summary, validate, components, wires, "
             "move, nudge, set-kind, set-value, set-rotation, rename, add-component, "
-            "delete, set-wire, set-text, clear-warnings or overlay"
+            "delete, set-wire, set-text, clear-warnings, check-netlist or overlay"
         )
 
     saved = session.save()

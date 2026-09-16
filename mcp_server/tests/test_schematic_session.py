@@ -58,6 +58,80 @@ def _session(directory: Path | None = None) -> ReconstructionSession:
     return session
 
 
+class NetlistMismatchTest(unittest.TestCase):
+    """A netlist/plan name mismatch must never discard a layout silently.
+
+    This was a real failure: the plan named U1..U30 because the analysis could not
+    read the designators, the netlist named R1/C1/R2, and every one of the 30
+    measured positions was quietly ignored. The parts were placed on a grid, the
+    sheet was sized for those three, and the file looked entirely plausible. It
+    reproduced almost none of the layout it was given.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.session = _session(Path(self.temp.name))
+
+    def test_check_reports_a_missing_component(self) -> None:
+        # The plan has R1 and U1; this netlist wants R1 and R9.
+        result = self.session.check_against_netlist("R1 a b 1k\nR9 b 0 1k\n.end\n")
+        self.assertFalse(result["ok"])
+        self.assertIn("R9", result["missing_from_plan"])
+        self.assertTrue(result["advice"])
+
+    def test_check_accepts_matching_names(self) -> None:
+        result = self.session.check_against_netlist("R1 a b 1k\n.end\n")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["missing_from_plan"], [])
+
+    def test_check_lists_unused_plan_components(self) -> None:
+        result = self.session.check_against_netlist("R1 a b 1k\n.end\n")
+        self.assertIn("U1", result["unused_in_plan"])
+
+    def test_build_refuses_positions_the_netlist_cannot_hold(self) -> None:
+        from multisim_mcp.schematic_builder import build_schematic
+
+        with self.assertRaises(ValueError) as caught:
+            with tempfile.TemporaryDirectory() as tmp:
+                build_schematic(
+                    "R1 a b 1k\n.end\n",
+                    Path(tmp) / "x.xml",
+                    probe_nets=[],
+                    explicit_positions={"U1": (5000.0, 5000.0)},
+                )
+        message = str(caught.exception)
+        self.assertIn("U1", message)
+        # The message must say what would happen and how to fix it, because a
+        # caller cannot tell from the output that their layout was ignored.
+        self.assertIn("Nothing would be placed", message)
+        self.assertIn("reference designators", message)
+
+    def test_build_restricts_positions_to_the_netlist(self) -> None:
+        # Positions for parts the netlist does not have are dropped rather than
+        # passed through, so the fit and routing work on the set that is placed.
+        result = self.session.build("R1 a b 1k\n.end\n", Path(self.temp.name) / "out.ms14")
+        self.assertEqual(result["positions_applied"], 1)
+        self.assertEqual(result["placed_from_plan"], 1)
+        self.assertTrue(
+            any("not in the netlist" in w for w in result["warnings"]),
+            result["warnings"],
+        )
+
+    def test_build_reports_netlist_parts_with_no_measured_position(self) -> None:
+        result = self.session.build(
+            "R1 a b 1k\nR7 b 0 1k\n.end\n", Path(self.temp.name) / "out.ms14"
+        )
+        self.assertTrue(
+            any("no measured position" in w for w in result["warnings"]),
+            result["warnings"],
+        )
+
+    def test_build_rejects_a_netlist_with_nothing_placeable(self) -> None:
+        with self.assertRaises(SessionError):
+            self.session.build("U1 a b sub\n.end\n", Path(self.temp.name) / "out.ms14")
+
+
 class CorrectionTest(unittest.TestCase):
     """Each correction must change the plan and be recorded."""
 

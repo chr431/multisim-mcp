@@ -3233,6 +3233,12 @@ def build_parser() -> argparse.ArgumentParser:
         "clear-warnings", help="drop analysis warnings once reviewed"
     )
 
+    check_action = review_actions.add_parser(
+        "check-netlist",
+        help="report whether the plan's designators match a netlist before building",
+    )
+    check_action.add_argument("--netlist", required=True, help="SPICE netlist file")
+
     overlay_action = review_actions.add_parser("overlay", help="re-render the review overlay")
     overlay_action.add_argument("--output", help="PNG path (default: <session>/overlay.png)")
 
@@ -3351,6 +3357,11 @@ def _schematic_review_command(args: Any) -> dict[str, Any]:
         session.set_wire(args.net, _parse_points(args.points))
     elif action == "clear-warnings":
         session.clear_warnings()
+    elif action == "check-netlist":
+        netlist_path = Path(args.netlist).expanduser()
+        if not netlist_path.is_file():
+            raise FileNotFoundError(f"netlist does not exist: {netlist_path}")
+        return session.check_against_netlist(netlist_path.read_text(encoding="utf-8-sig"))
     elif action == "overlay":
         return {"overlay": session.render(args.output).get("path")}
     elif action == "build":

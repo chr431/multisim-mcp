@@ -461,6 +461,39 @@ class ReconstructionSession:
         result = render_overlay(source, self.plan, destination)
         return result.to_dict()
 
+    def check_against_netlist(self, netlist: str) -> dict[str, Any]:
+        """Report whether the plan's names line up with a netlist.
+
+        A measured layout and a netlist come from different places, so their
+        reference designators can disagree -- and when they do, every position is
+        silently ignored and the parts are placed on a grid instead. That failure
+        produces a file that looks fine, so checking first is the only way to
+        catch it before building.
+        """
+        from ..schematic_builder import parse_netlist
+
+        parsed = parse_netlist(netlist)
+        wanted = {spec.refdes for spec in parsed.components}
+        have = {item.refdes for item in self.plan.components}
+        missing = sorted(wanted - have)
+        unused = sorted(have - wanted)
+        return {
+            "ok": not missing,
+            "netlist_components": len(wanted),
+            "plan_components": len(have),
+            "missing_from_plan": missing,
+            "unused_in_plan": unused,
+            "advice": (
+                []
+                if not missing
+                else [
+                    f"the netlist names {len(missing)} component(s) the plan does not "
+                    f"have: {', '.join(missing[:8])}",
+                    "rename plan components to match with `rename`, or adjust the netlist",
+                ]
+            ),
+        }
+
     def build(
         self,
         netlist: str,
@@ -475,8 +508,15 @@ class ReconstructionSession:
 
         This is fast: it uses the stored plan and never re-reads the image, which
         is what makes iterate-then-build practical.
+
+        Only components the netlist actually contains can be placed, because a
+        schematic is built from the netlist and any position for a part that is
+        not in it has nowhere to go. Positions for other plan components are
+        therefore dropped -- and reported in ``unplaced``, since silently
+        discarding them is how a caller ends up with a file that reproduced only
+        part of their drawing without saying so.
         """
-        from ..schematic_builder import build_schematic
+        from ..schematic_builder import build_schematic, parse_netlist
         from .assemble import build_request_from_plan
 
         if not str(netlist).strip():
@@ -487,12 +527,28 @@ class ReconstructionSession:
         xml_path = output.with_suffix(".xml")
         output.parent.mkdir(parents=True, exist_ok=True)
 
+        wanted = {spec.refdes for spec in parse_netlist(netlist).components}
+        if not wanted:
+            raise SessionError(
+                "the netlist contains no components this builder can place; check it "
+                "parses, for example that every part uses a supported reference prefix"
+            )
+        in_netlist = {
+            refdes: position
+            for refdes, position in (
+                (item.refdes, (item.x, item.y)) for item in self.plan.components
+            )
+            if refdes in wanted
+        }
+        unplaced = sorted(wanted - set(in_netlist))
+
         request = build_request_from_plan(
             self.plan,
             terminals={k: [tuple(p) for p in v] for k, v in (terminals or {}).items()} or None,
             fit_layout=fit_layout,
             power_symbols=power_symbols,
             tree_routing=tree_routing,
+            only_refdes=wanted,
         )
         build = build_schematic(
             netlist,
@@ -503,14 +559,29 @@ class ReconstructionSession:
             power_symbols=power_symbols,
             tree_routing=tree_routing,
         )
+        warnings = list(request.warnings)
+        if unplaced:
+            warnings.append(
+                f"{len(unplaced)} netlist component(s) have no measured position and "
+                f"were placed by the grid: {', '.join(unplaced[:8])}"
+                + (f" (+{len(unplaced) - 8} more)" if len(unplaced) > 8 else "")
+            )
+        skipped = len(self.plan.components) - len(in_netlist)
+        if skipped:
+            warnings.append(
+                f"{skipped} plan component(s) are not in the netlist, so they were not "
+                "placed; add them to the netlist or remove them from the plan"
+            )
         return {
             "ms14": str(output),
             "xml": str(xml_path),
             "positions_applied": len(request.positions),
             "routes_applied": len(request.routes),
+            "placed_from_plan": len(in_netlist),
+            "netlist_components": len(wanted),
             "layout_validation": build.get("layout_validation", {}),
             "assignment": request.to_dict(),
-            "warnings": list(request.warnings),
+            "warnings": warnings,
         }
 
 

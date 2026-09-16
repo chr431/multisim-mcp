@@ -215,6 +215,7 @@ def build_request_from_plan(
     power_symbols: bool = True,
     tree_routing: bool = True,
     min_tree_terminals: int = 3,
+    only_refdes: set[str] | None = None,
 ) -> BuildRequest:
     """Turn a reconstruction plan into an explicit-layout build request.
 
@@ -252,6 +253,11 @@ def build_request_from_plan(
         raise AssemblyError("grid must be positive")
 
     for component in plan.components:
+        # A schematic is built from the netlist, so a position for a part the
+        # netlist does not contain has nowhere to go. Restricting here keeps the
+        # fit and the routing working on exactly the set that will be placed.
+        if only_refdes is not None and component.refdes not in only_refdes:
+            continue
         request.positions[component.refdes] = (component.x, component.y)
     request.stats["components"] = len(request.positions)
 
