@@ -211,7 +211,7 @@ def build_request_from_plan(
     tolerance: float | None = None,
     grid_mil: float | None = None,
     fit_layout: bool = True,
-    clearance: float = 1.15,
+    clearance: float | None = None,
     power_symbols: bool = True,
     tree_routing: bool = True,
     min_tree_terminals: int = 3,
@@ -244,7 +244,7 @@ def build_request_from_plan(
     """
     if tolerance is not None and tolerance <= 0:
         raise AssemblyError("tolerance must be positive")
-    if clearance < 1.0:
+    if clearance is not None and clearance < 1.0:
         raise AssemblyError("clearance must be at least 1")
 
     request = BuildRequest()

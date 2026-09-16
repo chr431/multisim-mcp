@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Final, Iterable, Mapping, Sequence
 
 from .units import MIN_NATIVE_PITCH_UNITS, UnitError
 
@@ -63,6 +63,34 @@ class FitResult:
         }
 
 
+#: A native symbol's footprint, measured from the templates: 126 x 108 units.
+SYMBOL_WIDTH_UNITS: Final = 126.0
+SYMBOL_HEIGHT_UNITS: Final = 108.0
+
+#: Space a pin needs to leave its symbol, in units. A pin escape is 54 units in
+#: the router, so two symbols facing each other need twice that between their
+#: edges for both to escape, plus a little to spare for a wire to pass.
+PIN_ESCAPE_UNITS: Final = 54.0
+
+#: Minimum centre-to-centre spacing at which two native symbols can be placed AND
+#: both routed. Derived rather than chosen:
+#:
+#:     symbol width           126
+#:   + escape for this pin     54
+#:   + escape for the facing    54
+#:   + room for a wire to pass  18
+#:   ------------------------------
+#:                              252
+#:
+#: Anything closer builds a schematic whose pins cannot all be connected -- the
+#: router refuses, because a wire from one pin would have to cross the other
+#: symbol. Measured on a real section: parts drawn 40 units apart scaled by 1.15
+#: still failed to route, while a clearance giving ~250 units succeeded.
+MIN_ROUTABLE_SPACING_UNITS: Final = (
+    SYMBOL_WIDTH_UNITS + 2 * PIN_ESCAPE_UNITS + 18.0
+)
+
+
 def _min_pair_gap(positions: Mapping[str, tuple[float, float]]) -> float:
     """Smallest centre-to-centre distance between any two components."""
     items = list(positions.items())
@@ -81,22 +109,28 @@ def required_scale(
     positions: Mapping[str, tuple[float, float]],
     *,
     native_pitch: float = MIN_NATIVE_PITCH_UNITS,
-    clearance: float = 1.15,
+    clearance: float | None = None,
 ) -> float:
-    """Return the uniform scale that keeps every symbol clear of its neighbours.
+    """Return the uniform scale that leaves every symbol placeable AND routable.
 
-    ``clearance`` is a safety multiple over the bare pin pitch: two symbols whose
-    centres are exactly one pitch apart would have their pin leads touching, so a
-    little margin is required for the drawing to stay legible.
+    ``clearance`` multiplies the derived spacing. The default targets
+    :data:`MIN_ROUTABLE_SPACING_UNITS`, which is the distance at which two native
+    symbols can both have their pins connected. A smaller value places symbols
+    that do not overlap but whose pins cannot all be reached, and the build then
+    fails in the router rather than in the layout -- a confusing place to find a
+    spacing problem.
     """
     if native_pitch <= 0:
         raise UnitError("native_pitch must be positive")
-    if clearance < 1.0:
-        raise UnitError("clearance must be at least 1")
     gap = _min_pair_gap(positions)
-    target = native_pitch * clearance
     if gap == float("inf") or gap <= 0:
         return 1.0
+    if clearance is None:
+        target = MIN_ROUTABLE_SPACING_UNITS
+    else:
+        if clearance < 1.0:
+            raise UnitError("clearance must be at least 1")
+        target = native_pitch * clearance
     if gap >= target:
         return 1.0
     return target / gap
@@ -107,7 +141,7 @@ def fit_scale(
     *,
     page: tuple[float, float] | None = None,
     native_pitch: float = MIN_NATIVE_PITCH_UNITS,
-    clearance: float = 1.15,
+    clearance: float | None = None,
     max_scale: float = 40.0,
     margin_units: float = 60.0,
 ) -> FitResult:
@@ -163,7 +197,7 @@ def relax_positions(
     positions: Mapping[str, tuple[float, float]],
     *,
     native_pitch: float = MIN_NATIVE_PITCH_UNITS,
-    clearance: float = 1.15,
+    clearance: float | None = None,
     max_passes: int = 24,
     step_fraction: float = 0.5,
 ) -> dict[str, tuple[float, float]]:
@@ -177,7 +211,7 @@ def relax_positions(
     """
     if native_pitch <= 0:
         raise UnitError("native_pitch must be positive")
-    target = native_pitch * max(1.0, clearance)
+    target = MIN_ROUTABLE_SPACING_UNITS if clearance is None else native_pitch * max(1.0, clearance)
     names = list(positions)
     current = {name: [positions[name][0], positions[name][1]] for name in names}
 
@@ -211,7 +245,7 @@ def fit_and_relax(
     *,
     page: tuple[float, float] | None = None,
     native_pitch: float = MIN_NATIVE_PITCH_UNITS,
-    clearance: float = 1.15,
+    clearance: float | None = None,
     max_scale: float = 40.0,
     margin_units: float = 60.0,
     relax: bool = True,
@@ -227,7 +261,7 @@ def fit_and_relax(
     )
     if not relax or len(result.positions) < 2:
         return result
-    if result.min_gap_after >= native_pitch * clearance:
+    if result.min_gap_after >= (MIN_ROUTABLE_SPACING_UNITS if clearance is None else native_pitch * max(1.0, clearance)):
         return result
 
     relaxed = relax_positions(

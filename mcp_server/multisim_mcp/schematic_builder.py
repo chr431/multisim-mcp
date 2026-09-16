@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from multisim_mcp.layout_validation import validate_schematic_geometry
-from multisim_mcp.orthogonal_routing import route_pins, junction_point, pin_escape
+from multisim_mcp.orthogonal_routing import route, route_pins, junction_point, pin_escape
 
 from multisim_mcp.component_adapters import expand_component_adapters
 from multisim_mcp.native_xml import parse_native_xml, write_native_xml
@@ -86,6 +86,15 @@ class ComponentSpec:
     model: str | None = None
     model_definition: str | None = None
     parameters: list[str] = field(default_factory=list)
+
+
+#: Kinds whose trailing netlist token names a MODEL rather than a numeric value.
+#: A diode line is ``D1 a b 1N4148``, where ``1N4148`` selects a model; parsing it
+#: with the value parser raises, which made an ordinary modelled diode impossible
+#: to place. The token is still displayed on the symbol.
+MODEL_VALUE_KINDS: frozenset[str] = frozenset(
+    {"D", "QNPN", "QPNP", "JN", "JP", "ZN", "ZP", "S", "W", "MNMOS", "MPMOS"}
+)
 
 
 @dataclass(frozen=True)
@@ -2890,12 +2899,15 @@ def _ground_symbol_specs(
     positions: Mapping[str, Sequence[float]],
     *,
     occupied: Sequence[Any] = (),
-) -> tuple[list[ComponentSpec], dict[str, tuple[float, float]]]:
+) -> tuple[list[ComponentSpec], dict[str, tuple[float, float]], dict[str, str]]:
     """Create one local ground symbol per grounded component.
 
-    Returns ``(extra_specs, positions)``. Each spec is a GND component whose
-    single port sits on node 0, placed clear of the part it serves, so the
+    Returns ``(extra_specs, positions, owners)``. Each spec is a GND component
+    whose single port sits on node 0, placed clear of the part it serves, so the
     connection is made by the symbol itself and no ground wire is needed.
+    ``owners`` maps each symbol's reference designator to the part it belongs to,
+    so the router can exempt that one pair: the lead between a pin and its own
+    ground symbol is the connection, not an obstacle.
 
     A native symbol occupies roughly 126 x 108 storage units, so "clear" has to
     exceed that in at least one axis; a smaller clearance still trips the geometry
@@ -2914,26 +2926,31 @@ def _ground_symbol_specs(
             except (TypeError, ValueError):
                 continue
 
-    def free(x: float, y: float, dx: float = 150.0, dy: float = 132.0) -> bool:
+    def free(x: float, y: float, dx: float = 170.0, dy: float = 160.0) -> bool:
         return all(abs(x - ox) >= dx or abs(y - oy) >= dy for ox, oy in taken)
 
     extra: list[ComponentSpec] = []
     out: dict[str, tuple[float, float]] = {}
+    owners: dict[str, str] = {}
+    # The vertical steps avoid the symbol pitch. A ground symbol placed a fixed
+    # distance below a part's centre lands on the pin row of the part beneath it,
+    # and the signal router then cannot escape that pin without crossing the
+    # ground symbol -- a build failure on an otherwise valid layout.
     offsets = (
-        (0.0, 132.0),
-        (-150.0, 132.0),
-        (150.0, 132.0),
-        (-150.0, 0.0),
-        (150.0, 0.0),
-        (0.0, 264.0),
-        (-150.0, 264.0),
-        (150.0, 264.0),
-        (0.0, -132.0),
-        (-150.0, -132.0),
-        (150.0, -132.0),
-        (0.0, 396.0),
-        (-300.0, 0.0),
-        (300.0, 0.0),
+        (0.0, 160.0),
+        (-170.0, 160.0),
+        (170.0, 160.0),
+        (-170.0, 0.0),
+        (170.0, 0.0),
+        (0.0, 260.0),
+        (-170.0, 260.0),
+        (170.0, 260.0),
+        (0.0, -160.0),
+        (-170.0, -160.0),
+        (170.0, -160.0),
+        (0.0, 360.0),
+        (-340.0, 0.0),
+        (340.0, 0.0),
     )
     counter = 0
     for spec in specs:
@@ -2949,14 +2966,63 @@ def _ground_symbol_specs(
         bx, by = float(base[0]), float(base[1])
         chosen = next(
             ((bx + dx, by + dy) for dx, dy in offsets if free(bx + dx, by + dy)),
-            (bx, by + 132.0),
+            (bx, by + 160.0),
         )
         counter += 1
         refdes = f"GND{counter}"
         out[refdes] = chosen
+        owners[refdes] = spec.refdes
         taken.append(chosen)
         extra.append(ComponentSpec(kind="GND", refdes=refdes, nodes=["0"]))
-    return extra, out
+    return extra, out, owners
+
+
+def _branch_candidates(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    obstacles: Sequence[Mapping[str, Any]],
+) -> list[list[tuple[float, float]]]:
+    """Return corner sequences to try between two escape points, best first.
+
+    A single L has only two forms, and on a crowded sheet neither may be clear.
+    The extra candidates step out to a free lane before turning, which is how a
+    person routes around a part: go past it, then turn. Candidates are ordered by
+    how few corners they add, so the simplest clear route wins.
+    """
+    x0, y0 = start
+    x1, y1 = end
+    options: list[list[tuple[float, float]]] = [
+        [(x1, y0)],                      # horizontal leg first
+        [(x0, y1)],                      # vertical leg first
+    ]
+    # Lanes beyond the two endpoints: stepping clear of whatever is between them.
+    span_x = max(abs(x1 - x0) * 0.5, 60.0)
+    span_y = max(abs(y1 - y0) * 0.5, 60.0)
+    for beyond in (60.0, 120.0, 200.0, 320.0):
+        options.append([(x0, y0 - beyond), (x1, y0 - beyond)])
+        options.append([(x0, y0 + beyond), (x1, y0 + beyond)])
+        options.append([(x0 - beyond, y0), (x0 - beyond, y1)])
+        options.append([(x0 + beyond, y0), (x0 + beyond, y1)])
+    # A dog-leg out and back, which clears a box that straddles both straight Ls.
+    options.append([(x0, y0 + span_y), (x1, y0 + span_y)])
+    options.append([(x0 + span_x, y0), (x0 + span_x, y1)])
+    return options
+
+
+def _power_obstacle_index(
+    obstacles: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[float, float]]:
+    """Map each power symbol's reference designator to its position."""
+    index: dict[str, tuple[float, float]] = {}
+    for item in obstacles:
+        refdes = item.get("refdes")
+        if not isinstance(refdes, str):
+            continue
+        try:
+            index[refdes] = (float(item["x"]), float(item["y"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return index
 
 
 def _path_is_clear(
@@ -2964,32 +3030,56 @@ def _path_is_clear(
     obstacles: Sequence[Mapping[str, Any]],
     start: Mapping[str, Any],
     end: Mapping[str, Any],
+    *,
+    clearance: float = 12.0,
 ) -> bool:
     """Return whether every segment of ``path`` avoids the other components.
 
-    The two endpoints belong to the wire's own pins, so their owners are exempt:
-    a wire legitimately touches the parts it connects.
+    A wire may touch a component only at a pin, so the two owners of the pins this
+    branch joins are permitted to have the wire run ALONG their edge -- but not
+    across their body. Exempting an owner entirely hides the error this predicate
+    exists to catch: a route crossing a symbol on its own net.
+
+    ``clearance`` matches the margin the geometry validator applies, so the two
+    agree about what "clear" means.
     """
     own = {start.get("refdes"), end.get("refdes")}
     for a, b in zip(path, path[1:]):
         if abs(a[0] - b[0]) > 0.01 and abs(a[1] - b[1]) > 0.01:
             return False  # not axis-aligned
+        horizontal = abs(a[1] - b[1]) <= 0.01
+        seg_x0, seg_x1 = min(a[0], b[0]), max(a[0], b[0])
+        seg_y0, seg_y1 = min(a[1], b[1]), max(a[1], b[1])
         for obstacle in obstacles:
-            if obstacle.get("refdes") in own:
-                continue
             try:
                 x0 = float(obstacle["x"])
                 y0 = float(obstacle["y"])
             except (KeyError, TypeError, ValueError):
                 continue
-            width = float(obstacle.get("width", 126.0))
-            height = float(obstacle.get("height", 108.0))
-            x1, y1 = x0 + width, y0 + height
-            lo_x, hi_x = min(a[0], b[0]), max(a[0], b[0])
-            lo_y, hi_y = min(a[1], b[1]), max(a[1], b[1])
-            # A segment inside the box, or crossing it, means the route is blocked.
-            if lo_x < x1 and hi_x > x0 and lo_y < y1 and hi_y > y0:
-                return False
+            x1 = x0 + float(obstacle.get("width", 126.0))
+            y1 = y0 + float(obstacle.get("height", 108.0))
+            # Inflate by the clearance the validator uses, so the two agree.
+            if not (
+                seg_x0 < x1 + clearance
+                and seg_x1 > x0 - clearance
+                and seg_y0 < y1 + clearance
+                and seg_y1 > y0 - clearance
+            ):
+                continue
+            if obstacle.get("refdes") in own:
+                # Legitimate only where the segment runs along an edge, which is
+                # how a pin lead leaves its own symbol. Crossing the body is not,
+                # even on the component's own net.
+                along_edge = (
+                    horizontal
+                    and (abs(a[1] - y0) <= clearance or abs(a[1] - y1) <= clearance)
+                ) or (
+                    not horizontal
+                    and (abs(a[0] - x0) <= clearance or abs(a[0] - x1) <= clearance)
+                )
+                if along_edge:
+                    continue
+            return False
     return True
 
 
@@ -3230,7 +3320,7 @@ def build_schematic(
     # the single global ground becomes one local symbol per grounded part and the
     # ground net then needs no wiring at all.
     if power_symbols:
-        extra_ground, ground_positions = _ground_symbol_specs(
+        extra_ground, ground_positions, power_symbol_owners = _ground_symbol_specs(
             specs,
             explicit_positions,
             occupied=list(explicit_positions.items()),
@@ -3239,6 +3329,32 @@ def build_schematic(
             specs = [item for item in specs if item.kind != "GND"]
             specs.extend(extra_ground)
             explicit_positions = {**explicit_positions, **ground_positions}
+            # A local ground symbol is a real body on the sheet, so the signal
+            # router has to know about it. Without this its pin escapes run
+            # straight through the ground symbols placed beside their neighbours,
+            # and `route_pins` refuses the net -- the build fails on a layout that
+            # is perfectly legitimate.
+            power_obstacles = [
+                {
+                    "refdes": refdes,
+                    "x": float(x),
+                    "y": float(y),
+                    "width": 126.0,
+                    "height": 108.0,
+                }
+                for refdes, (x, y) in ground_positions.items()
+            ]
+            # Record which part each ground symbol serves. A symbol placed beside
+            # its own part must not block that part's pins -- the lead from the pin
+            # to the symbol is the connection, so the router has to be allowed to
+            # draw it.
+            ground_owners = dict(power_symbol_owners)
+        else:
+            power_obstacles = []
+            ground_owners = {}
+    else:
+        power_obstacles = []
+        ground_owners = {}
 
     grid_columns = min(6, max(2, math.ceil(math.sqrt(max(1, len(specs))))))
     grid_origin_x = 36
@@ -3374,14 +3490,21 @@ def build_schematic(
         display_value = spec.value
         numeric_value = None
         if spec.value is not None:
-            numeric_value, display_value = parse_spice_value(spec.value)
-            _set_component_value(
-                element_item,
-                spec.kind,
-                display_value,
-                numeric_value,
-                spec.parameters,
-            )
+            # Not every component's trailing token is a value. For a device whose
+            # behaviour comes from a model -- a diode, a transistor, a switch -- the
+            # token is the model name, and parsing it as a number raises. The model
+            # name is still shown on the symbol, it just has no numeric equivalent.
+            if spec.kind in MODEL_VALUE_KINDS:
+                display_value = spec.value
+            else:
+                numeric_value, display_value = parse_spice_value(spec.value)
+                _set_component_value(
+                    element_item,
+                    spec.kind,
+                    display_value,
+                    numeric_value,
+                    spec.parameters,
+                )
         _configure_component_semantics(element_item, spec)
         if spec.kind in {"OSC6", "XFG3"}:
             _add_virtual_instrument_state(root, spec, circuit_item)
@@ -3502,7 +3625,29 @@ def build_schematic(
             # so it needs no wires. Emitting them anyway would draw the long
             # ground run that those symbols exist to avoid.
             continue
-        routing_obstacles = list(placements)
+        # A part must not be blocked by a ground symbol that stands beside it: such
+        # a symbol was placed to be adjacent to that part, so any wire leaving that
+        # part legitimately passes close to it. Every other ground symbol remains
+        # an obstacle, because there is no connection to it.
+        #
+        # Note this exempts by POSITION, not by which net is being routed. A ground
+        # symbol belongs to one part but can sit near several, and exempting it only
+        # for its owner's own ground net still blocks that owner's signal pins --
+        # which is exactly how a valid layout failed to build.
+        nearby = {
+            symbol
+            for symbol, entry in ((s, p) for s, p in _power_obstacle_index(power_obstacles).items())
+            if any(
+                abs(float(pin["x"]) - entry[0]) < 200.0
+                and abs(float(pin["y"]) - entry[1]) < 200.0
+                for pin in conns
+            )
+        }
+        routing_obstacles = [
+            item
+            for item in list(placements) + list(power_obstacles)
+            if item.get("refdes") not in nearby
+        ]
         # Reserve every other net's pin escape before routing the first net.
         # Otherwise an early supply wire can occupy a later signal's only exit.
         for other, pins in connections.items():
@@ -3547,7 +3692,16 @@ def build_schematic(
             _clear(points)
             occupied = [segment for other, paths in net_wires.items() if other != name
                         for path in paths for segment in zip(path, path[1:])]
-            if via is not None:
+            prescribed = explicit_routes.get(name)
+            measured = bool(prescribed) and len(prescribed) >= 2 and len(conns) == 2
+            if measured:
+                # A caller-supplied route wins over everything, including the tree
+                # shape and the branch candidates. It came from the drawing, so it
+                # is the most faithful description available; reproducing it is the
+                # point of the option. Anchoring still applies, so the ends land on
+                # the real pins.
+                path = _anchor_route(prescribed, start, end)
+            elif via is not None:
                 # A tree branch: leave each pin along its own lead direction,
                 # then join the two escape points with a single L. Going straight
                 # from pin to pin would cut through the symbol bodies, which is
@@ -3563,26 +3717,41 @@ def build_schematic(
                 end_point = (float(end["x"]), float(end["y"]))
                 start_escape = pin_escape(start, routing_obstacles)
                 end_escape = pin_escape(end, routing_obstacles)
-                corner = _tree_corner(start_escape, end_escape)
-                candidate = _simplify_orthogonal(
-                    [start_point, start_escape, corner, end_escape, end_point]
-                )
-                if _path_is_clear(candidate, routing_obstacles, start, end):
-                    path = candidate
-                else:
-                    path = route_pins(start, end, routing_obstacles, occupied)
+                # Two L shapes are possible between the escapes. Try both, plus the
+                # two dog-legs that step out to a clear lane first, and take the
+                # first that is actually clear for its whole length. Accepting only
+                # the dominant-axis L and falling back to a point-to-point router
+                # produced wires that crossed neighbouring components -- the router
+                # prioritises reaching the target over avoiding obstacles it was
+                # not told to weigh.
+                candidates = _branch_candidates(start_escape, end_escape, routing_obstacles)
+                path = None
+                for candidate in candidates:
+                    full = _simplify_orthogonal(
+                        [start_point, start_escape, *candidate, end_escape, end_point]
+                    )
+                    if _path_is_clear(full, routing_obstacles, start, end):
+                        path = full
+                        break
+                if path is None:
+                    # No straight L fits. On a crowded sheet a branch often has to
+                    # go around a part that stands between its two ends, which a
+                    # single corner cannot express. The A* router handles exactly
+                    # that, so fall back to it rather than emitting a wire that
+                    # crosses a component -- the geometry validator would flag it
+                    # and a person could not read the result.
+                    try:
+                        detour = route(
+                            start_escape, end_escape, list(routing_obstacles),
+                            occupied=occupied,
+                        )
+                        path = _simplify_orthogonal(
+                            [start_point, *detour, end_point]
+                        )
+                    except ValueError:
+                        path = route_pins(start, end, routing_obstacles, occupied)
             else:
-                prescribed = explicit_routes.get(name)
-                if prescribed and len(prescribed) >= 2 and len(conns) == 2:
-                    # A measured route: reproduce it exactly, but still anchor its
-                    # ends on the two pin positions so the net stays connected. A
-                    # prescribed route describes one wire, so it applies only to
-                    # nets that are exactly one wire; a multi-drop net needs a
-                    # trunk-and-branch decomposition the caller has not supplied,
-                    # and misapplying it would emit overlapping wires.
-                    path = _anchor_route(prescribed, start, end)
-                else:
-                    path = route_pins(start, end, routing_obstacles, occupied)
+                path = route_pins(start, end, routing_obstacles, occupied)
             for px, py in path:
                 points.append(ET.Element("Item", {"X": f"{px:g}", "Y": f"{py:g}"}))
             modifier = wire.find("./ElectricalObject/ModifierInfo/Element")
@@ -3603,7 +3772,7 @@ def build_schematic(
         wire_items: list[ET.Element] = []
         if len(conns) == 2:
             first, second = conns
-            add_wire(first, second, second["extpin_id"])
+            add_wire(first, second, second["extpin_id"], via="escape")
         elif tree_routing:
             # A net with three or more drops is normally drawn as a star: every
             # pin gets a wire to one shared junction. That is electrically right
