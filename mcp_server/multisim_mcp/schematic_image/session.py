@@ -559,6 +559,18 @@ class ReconstructionSession:
             power_symbols=power_symbols,
             tree_routing=tree_routing,
         )
+        # The builder writes the XML; the .ms14 container has to be encoded from
+        # it. Reporting the path without producing the file leaves the caller with
+        # a success result pointing at nothing -- and Multisim then treats the
+        # missing file as a corrupt one.
+        from ..multisim_client import Ms14Codec
+
+        encoded = Ms14Codec().encode(str(xml_path), str(output))
+        if not output.is_file():
+            raise SessionError(
+                f"the schematic was written to {xml_path} but encoding {output} "
+                "produced no file"
+            )
         warnings = list(request.warnings)
         if unplaced:
             warnings.append(
@@ -575,6 +587,7 @@ class ReconstructionSession:
         return {
             "ms14": str(output),
             "xml": str(xml_path),
+            "encode": encoded,
             "positions_applied": len(request.positions),
             "routes_applied": len(request.routes),
             "placed_from_plan": len(in_netlist),

@@ -131,6 +131,19 @@ class NetlistMismatchTest(unittest.TestCase):
         with self.assertRaises(SessionError):
             self.session.build("U1 a b sub\n.end\n", Path(self.temp.name) / "out.ms14")
 
+    def test_build_actually_produces_the_ms14_file(self) -> None:
+        # The builder writes the XML; the .ms14 container has to be encoded from
+        # it. Skipping that step returned a success result naming a file that did
+        # not exist, and Multisim then treated the missing file as a corrupt one
+        # and crashed its worker -- the failure looked like a Multisim fault
+        # rather than a missing encode.
+        target = Path(self.temp.name) / "encoded.ms14"
+        result = self.session.build("R1 a b 1k\n.end\n", target)
+        self.assertTrue(target.is_file(), "build must produce the file it names")
+        self.assertGreater(target.stat().st_size, 0)
+        self.assertEqual(result["ms14"], str(target))
+        self.assertIn("encode", result)
+
 
 class CorrectionTest(unittest.TestCase):
     """Each correction must change the plan and be recorded."""
