@@ -105,32 +105,72 @@ def _min_pair_gap(positions: Mapping[str, tuple[float, float]]) -> float:
     return best
 
 
+def _gap_percentile(
+    positions: Mapping[str, tuple[float, float]], percentile: float
+) -> float:
+    """A representative nearest-neighbour distance, ignoring a few tight pairs.
+
+    Scaling the whole drawing by its single closest pair makes the layout hostage
+    to one badly placed component: measured on a real section, one pair 39 units
+    apart forced a 6.5x scale and produced a drawing 63 inches wide. Using a low
+    percentile instead leaves the bulk correctly spaced and lets
+    :func:`relax_positions` move the handful of outliers, which is a local change
+    rather than a global one.
+    """
+    items = list(positions.items())
+    if len(items) < 2:
+        return float("inf")
+    nearest: list[float] = []
+    for index in range(len(items)):
+        ax, ay = items[index][1]
+        best = float("inf")
+        for other in range(len(items)):
+            if other == index:
+                continue
+            bx, by = items[other][1]
+            best = min(best, math.hypot(ax - bx, ay - by))
+        if best != float("inf"):
+            nearest.append(best)
+    if not nearest:
+        return float("inf")
+    nearest.sort()
+    return nearest[min(len(nearest) - 1, int(percentile * (len(nearest) - 1)))]
+
+
 def required_scale(
     positions: Mapping[str, tuple[float, float]],
     *,
     native_pitch: float = MIN_NATIVE_PITCH_UNITS,
     clearance: float | None = None,
 ) -> float:
-    """Return the uniform scale that leaves every symbol placeable AND routable.
+    """Return the uniform scale that leaves symbols placeable AND routable.
+
+    The scale is set from a LOW PERCENTILE of the nearest-neighbour distances, not
+    the single closest pair. Scaling by the closest pair makes the whole drawing
+    hostage to one badly placed component: on a real section a single pair 39 units
+    apart forced a 6.5x scale and a drawing 63 inches wide, when the remaining 22
+    parts were already adequately spaced. The few genuinely tight pairs are then
+    moved individually by :func:`relax_positions`, which is a local fix.
 
     ``clearance`` multiplies the derived spacing. The default targets
-    :data:`MIN_ROUTABLE_SPACING_UNITS`, which is the distance at which two native
-    symbols can both have their pins connected. A smaller value places symbols
-    that do not overlap but whose pins cannot all be reached, and the build then
-    fails in the router rather than in the layout -- a confusing place to find a
-    spacing problem.
+    :data:`MIN_ROUTABLE_SPACING_UNITS`, the distance at which two native symbols
+    can both have their pins connected. A smaller value places symbols that do not
+    overlap but whose pins cannot all be reached, and the build then fails in the
+    router rather than in the layout -- a confusing place to find a spacing
+    problem.
     """
     if native_pitch <= 0:
         raise UnitError("native_pitch must be positive")
-    gap = _min_pair_gap(positions)
-    if gap == float("inf") or gap <= 0:
-        return 1.0
     if clearance is None:
         target = MIN_ROUTABLE_SPACING_UNITS
+        gap = _gap_percentile(positions, 0.2)
     else:
         if clearance < 1.0:
             raise UnitError("clearance must be at least 1")
         target = native_pitch * clearance
+        gap = _min_pair_gap(positions)
+    if gap == float("inf") or gap <= 0:
+        return 1.0
     if gap >= target:
         return 1.0
     return target / gap
