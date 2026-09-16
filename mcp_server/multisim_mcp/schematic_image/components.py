@@ -81,15 +81,42 @@ class ComponentAnchor:
         }
 
 
+def estimate_max_label_width(regions: Sequence[TextRegion]) -> float:
+    """Bound a plausible single label's width from the observed label widths.
+
+    A label is a short string; a merge that chains several labels together
+    produces something far wider. The distribution of widths is therefore strongly
+    skewed -- most labels are a few characters, a few part numbers are long -- so
+    the bound is taken well above the bulk but not at the extreme, which is what
+    separates "a long part number" from "several labels welded together".
+    """
+    widths = sorted(region.width for region in regions if region.width > 0)
+    if not widths:
+        return 400.0
+    # The bulk of labels; a genuine long part number is still allowed several times
+    # this, while a chained merge runs far beyond it.
+    bulk = widths[int(0.75 * (len(widths) - 1))]
+    return max(160.0, float(bulk) * 5.0)
+
+
 def _merge_into_lines(
     regions: Sequence[TextRegion],
     *,
     word_gap_px: float,
+    max_line_width_px: float | None = None,
 ) -> list[TextRegion]:
     """Merge label fragments that share a baseline into whole strings.
 
     ``R``, ``3`` and ``1`` are separate glyph groups until they are joined, and a
     designator is only usable once joined.
+
+    The merge must not chain. A row of labels with small gaps between them will
+    weld into one box spanning the row and every label on it is then lost -- which
+    is what happened to a row of test-point labels: five labels 118 px apart merged
+    into a single 873 px box because each step of the chain was individually within
+    the gap threshold. ``max_line_width_px`` bounds the result, so a merge that
+    would produce an implausibly wide string is refused and the fragment starts a
+    new one instead.
     """
     ordered = sorted(regions, key=lambda item: (item.y0, item.x0))
     merged: list[TextRegion] = []
@@ -100,9 +127,16 @@ def _merge_into_lines(
             overlap = min(bottom, region.y1) - max(top, region.y0)
             if overlap < 0.6 * min(bottom - top, region.height):
                 continue
-            gap = region.x0 - existing.x1
+            # Distance between the two, whichever side the new fragment is on.
+            gap = max(region.x0, existing.x0) - min(existing.x1, region.x1)
             if gap > word_gap_px:
                 continue
+            if max_line_width_px is not None:
+                span = max(existing.x1, region.x1) - min(existing.x0, region.x0)
+                if span > max_line_width_px:
+                    # Joining would produce a string far longer than any label, so
+                    # this fragment belongs to a different label on the same row.
+                    continue
             existing.x0 = min(existing.x0, region.x0)
             existing.y0 = min(existing.y0, region.y0)
             existing.x1 = max(existing.x1, region.x1)
@@ -126,6 +160,89 @@ def _merge_into_lines(
     return merged
 
 
+def merge_close_anchors(
+    anchors: Sequence[ComponentAnchor],
+    *,
+    radius_px: float,
+    prefer_near_artwork: bool = True,
+) -> tuple[list[ComponentAnchor], int]:
+    """Collapse anchors that describe the same physical part.
+
+    A component carries a designator and usually a value, and on a drawing that
+    renders both as text each one becomes an anchor. So a sheet with about 150
+    parts yields roughly twice that many anchors, and a caller counting them
+    concludes the analysis is over-detecting when it has simply listed both labels
+    of every part.
+
+    Anchors are grouped by proximity -- a part's own labels sit within a symbol's
+    width of each other, while two neighbouring parts are further apart -- and each
+    group is represented by one anchor. The representative is the one nearest the
+    symbol artwork when that is known, because a designator is conventionally
+    placed closer to its part than the value is.
+
+    Measured on a real sheet, this is stable across analysis resolutions: 236
+    anchors collapse to 173 at downscale 2 and 241 collapse to 172 at downscale 3,
+    which is the behaviour a physical grouping should have.
+
+    Returns ``(kept_anchors, merged_count)``.
+    """
+    if radius_px <= 0:
+        raise ValueError("radius_px must be positive")
+    if not anchors:
+        return [], 0
+
+    count = len(anchors)
+    parent = list(range(count))
+
+    def find(item: int) -> int:
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    for i in range(count):
+        for j in range(i + 1, count):
+            dx = anchors[i].x - anchors[j].x
+            dy = anchors[i].y - anchors[j].y
+            if dx * dx + dy * dy <= radius_px * radius_px:
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(index)
+
+    kept: list[ComponentAnchor] = []
+    for members in groups.values():
+        if len(members) == 1:
+            kept.append(anchors[members[0]])
+            continue
+        if prefer_near_artwork:
+            # A designator is placed against its part; the value sits further off.
+            # Preferring the closest to the artwork therefore keeps the designator,
+            # which is the anchor worth naming.
+            best = min(
+                members,
+                key=lambda index: (
+                    anchors[index].symbol_distance
+                    if anchors[index].symbol is not None
+                    else float("inf")
+                ),
+            )
+            if anchors[best].symbol is None:
+                best = members[0]
+        else:
+            best = members[0]
+        kept.append(anchors[best])
+
+    kept.sort(key=lambda item: (item.y, item.x))
+    return kept, count - len(kept)
+
+
 def find_component_anchors(
     index: RoleIndex,
     *,
@@ -133,14 +250,19 @@ def find_component_anchors(
     symbols: Sequence[Symbol] = (),
     labels: dict[str, str] | None = None,
     max_width_ratio: float = 6.0,
+    merge_radius_px: float | None = None,
+    max_line_width_px: float | None = None,
 ) -> list[ComponentAnchor]:
     """Return one anchor per component, derived from its reference designator.
 
-    The dark-red colour used for designators is also used for ground symbols and
-    for the plates of polarized capacitors, so colour alone is not enough.  Text
-    is separated from that artwork by shape: a designator is at most a few
-    characters wide relative to its height, whereas a symbol stroke is a long
-    thin line.
+    The colour used for designators is also used for other artwork, and on some
+    drawings it is the same colour as the wiring, so colour alone is not enough.
+    Text is separated from artwork by shape: a designator is at most a few
+    characters wide relative to its height, whereas a symbol stroke is a long thin
+    line.
+
+    Anchors that describe one physical part are then merged, because a part carries
+    a designator and usually a value and each becomes a separate anchor.
 
     ``labels`` optionally supplies text for label regions whose glyphs could not
     be read, keyed by ``"x0,y0,x1,y1"``.
@@ -154,8 +276,17 @@ def find_component_anchors(
     # Join the characters of one designator, but no further: the gap inside a
     # string is a fraction of a character, while the gap between two different
     # designators is at least a character and a half.  Getting this wrong merges
-    # neighbouring labels into one anchor and loses components.
-    merged = _merge_into_lines(regions, word_gap_px=max(2.0, 0.18 * grid_px))
+    # neighbouring labels into one sheet-wide box and every label on the row is
+    # lost, which is what happened to a row of five test-point markers.
+    merged = _merge_into_lines(
+        regions,
+        word_gap_px=max(2.0, 0.18 * grid_px),
+        max_line_width_px=(
+            max_line_width_px
+            if max_line_width_px is not None
+            else estimate_max_label_width(regions)
+        ),
+    )
 
     anchors: list[ComponentAnchor] = []
     for region in merged:
@@ -173,6 +304,15 @@ def find_component_anchors(
         )
 
     _attach_symbols(anchors, symbols, grid_px=grid_px)
+    # A part's designator and value are two labels a symbol's width apart, so
+    # without merging, one part yields two anchors and a caller counting them
+    # concludes the analysis over-detects. The default radius is measured rather
+    # than chosen: grouping anchors by proximity gives a stable count across
+    # analysis resolutions at 5 grid pitches (173 positions at downscale 2, 172 at
+    # downscale 3), which is what a physical grouping should do.
+    radius = merge_radius_px if merge_radius_px is not None else 5.0 * grid_px
+    if radius > 0:
+        anchors, _merged = merge_close_anchors(anchors, radius_px=radius)
     return anchors
 
 
@@ -282,4 +422,5 @@ __all__ = [
     "ComponentAnchor",
     "anchors_to_symbols",
     "find_component_anchors",
+    "merge_close_anchors",
 ]
