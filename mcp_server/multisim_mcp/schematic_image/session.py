@@ -26,6 +26,8 @@ use exactly the same interface.
 from __future__ import annotations
 
 import json
+import math
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -524,6 +526,172 @@ class ReconstructionSession:
         ]
         out.sort(key=lambda item: -item["count"])
         return out[: limit or len(out)]
+
+    def render_label_sheet(
+        self,
+        output_png: str | Path | None = None,
+        *,
+        kind: str | None = None,
+        limit: int = 0,
+        columns: int = 6,
+        rows: int = 40,
+        zoom: int = 4,
+    ) -> dict[str, Any]:
+        """Write numbered crops of the located labels, so they can be read in bulk.
+
+        Locating labels is exact and automatic; reading them needs eyes. This is
+        the interface between the two: each label is cropped at a legible zoom and
+        numbered, and the returned index maps a number to the rectangle it came
+        from. A caller reads the images and writes the text back keyed by number,
+        which turns several hundred separate looks into a handful of images.
+
+        This is why the plugin does not need OCR: the parts that can be automated
+        are, and the part that needs judgement is presented efficiently to
+        whatever is good at it.
+        """
+        from .sheet import render_label_sheet as render
+        from .text import TextRegion
+
+        regions = (self.report.get("labels") or {}).get("regions") or []
+        selected = [row for row in regions if not kind or row.get("kind") == kind]
+        if limit:
+            selected = selected[:limit]
+        if not selected:
+            raise SessionError(
+                "this session has no located labels to render; re-analyse with a "
+                "palette that matches the drawing"
+            )
+        source = self.source_image
+        if source is None:
+            raise SessionError("this session has no readable source image")
+
+        # Rebuild lightweight region records: the sheet renderer only needs the
+        # rectangles and the identity a reading is written back with.
+        rebuilt = [
+            TextRegion(
+                x0=int(row["bbox"][0]),
+                y0=int(row["bbox"][1]),
+                x1=int(row["bbox"][2]),
+                y1=int(row["bbox"][3]),
+                role=str(row.get("role") or "text"),
+                cluster=int(row.get("cluster", -1)),
+            )
+            for row in selected
+        ]
+        destination = Path(output_png) if output_png else self.directory / "labels.png"
+        # Label rectangles are in analysis pixels; the crops come from the original
+        # file. Without this conversion every crop lands on blank paper.
+        region_scale = float(self.plan.calibration.get("analysis_scale") or 1.0)
+        result = render(
+            source,
+            rebuilt,
+            destination,
+            columns=columns,
+            rows=rows,
+            zoom=zoom,
+            region_scale=region_scale,
+        )
+
+        # Persist the index beside the session so a later call can map a reading
+        # back without re-deriving it from the image.
+        index_path = self.directory / "label-index.json"
+        index_path.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return {**result.to_dict(), "index_path": str(index_path)}
+
+    def apply_labels(self, readings: Mapping[str, str]) -> dict[str, Any]:
+        """Write label readings back, keyed by contact-sheet number or rectangle.
+
+        Accepts a key either as the number from a contact sheet or as the
+        ``"x0,y0,x1,y1"`` rectangle the reading belongs to, so a caller can work
+        from whichever is convenient. Names any component whose label received a
+        reading that looks like a reference designator.
+
+        The sheet does not have to have been rendered in this session: a number is
+        resolved against the report's own label order, which is the same order the
+        sheet draws them in, so the two can never disagree.
+        """
+        readings = {str(key): str(value) for key, value in (readings or {}).items()}
+        if not readings:
+            raise SessionError("no readings were supplied")
+
+        regions = (self.report.get("labels") or {}).get("regions")
+        if regions is None:
+            raise SessionError(
+                "this session kept no label rectangles, so readings cannot be matched "
+                "to components; re-analyse the image"
+            )
+
+        # Resolve numbers through the index if one was written, and fall back to
+        # the report's own ordering so a reading still applies without it.
+        by_number: dict[str, list[int]] = {}
+        index_path = self.directory / "label-index.json"
+        if index_path.is_file():
+            try:
+                payload = json.loads(index_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            for entry in payload.get("index") or []:
+                box = entry.get("bbox")
+                if isinstance(box, list) and len(box) == 4:
+                    by_number[str(entry.get("number"))] = [int(v) for v in box]
+        for position, region in enumerate(regions):
+            box = region.get("bbox")
+            if isinstance(box, list) and len(box) == 4:
+                by_number.setdefault(str(position), [int(v) for v in box])
+
+        applied = 0
+        named = 0
+        px_per_unit = float(self.plan.calibration.get("px_per_unit") or 0.0)
+        for key, text in readings.items():
+            box = by_number.get(key)
+            if box is None and "," in key:
+                try:
+                    box = [int(float(part)) for part in key.split(",")]
+                except ValueError:
+                    continue
+            if not box or len(box) != 4:
+                continue
+            for region in regions:
+                if region.get("bbox") != box:
+                    continue
+                region["text"] = text
+                region["text_source"] = "override"
+                applied += 1
+                break
+
+            # Name the anchor nearest this label, when the reading looks like a
+            # designator: a letter run followed by digits. Values such as "100nF"
+            # start with a digit, so they are recorded but not used as names.
+            candidate = "".join(ch for ch in text.upper() if ch.isalnum() or ch in "._-")
+            if not re.match(r"^[A-Z]{1,3}[0-9]", candidate) or px_per_unit <= 0:
+                continue
+            target_x = ((box[0] + box[2]) / 2.0) / px_per_unit
+            target_y = ((box[1] + box[3]) / 2.0) / px_per_unit
+            best: tuple[float, PlannedComponent] | None = None
+            for component in self.plan.components:
+                distance = math.hypot(component.x - target_x, component.y - target_y)
+                if best is None or distance < best[0]:
+                    best = (distance, component)
+            if best is None or best[0] > 200.0:
+                continue
+            component = best[1]
+            if component.refdes == candidate:
+                continue
+            try:
+                self.rename(component.refdes, candidate)
+            except SessionError:
+                continue
+            named += 1
+
+        self.save()
+        return {
+            "readings_supplied": len(readings),
+            "labels_updated": applied,
+            "components_named": named,
+            "corrections_applied": len(self.corrections),
+        }
 
     def check_against_netlist(self, netlist: str) -> dict[str, Any]:
         """Report whether the plan's names line up with a netlist.
