@@ -2598,6 +2598,253 @@ def run_natural_common_emitter(text: str, output_dir: str, execute: bool = False
     return run(text, output_dir, execute=execute)
 
 
+@mcp.tool(com_serialized=False)
+def read_schematic_image(
+    image_path: str,
+    session_dir: str,
+    dpi: float | None = None,
+    paper: str | None = None,
+    page_width_mm: float | None = None,
+    downscale: int = 2,
+) -> dict[str, Any]:
+    """Read a schematic supplied as a picture and start a review session.
+
+    This is the SLOW step -- roughly thirty seconds on a large sheet -- and it runs
+    once. Everything afterwards uses ``review_schematic_session``, which never
+    re-reads the image and returns immediately.
+
+    Accepts a PNG or JPEG export, scan or screenshot. The result reports the page
+    scale, every component with an explicit position, the vectorised wire graph,
+    the labels it located, and what to look at next. It never writes a schematic,
+    never starts Multisim, and never guesses silently: an ambiguous scale raises,
+    and unread labels are reported as unread rather than invented.
+
+    Pass ``dpi`` whenever the export resolution is known. ISO A-series sheets all
+    share one aspect ratio, so a drawing's scale cannot be recovered from the image
+    alone; ``paper`` or ``page_width_mm`` pin it explicitly instead.
+
+    The session is a directory of plain JSON, so it can be inspected or corrected
+    by anything that reads and writes files.
+    """
+    from multisim_mcp.schematic_image.session import ReconstructionSession
+
+    if not isinstance(image_path, str) or not image_path.strip():
+        raise ValueError("image_path must not be empty")
+    if not isinstance(session_dir, str) or not session_dir.strip():
+        raise ValueError("session_dir must not be empty")
+    if dpi is not None and not 1.0 <= float(dpi) <= 100_000.0:
+        raise ValueError("dpi must be between 1 and 100000")
+    if downscale < 1:
+        raise ValueError("downscale must be at least 1")
+
+    session = ReconstructionSession.analyse(
+        image_path,
+        session_dir,
+        dpi=None if dpi is None else float(dpi),
+        paper=paper,
+        page_width_mm=page_width_mm,
+        downscale=int(downscale),
+    )
+    # Save before anything optional, so a later failure cannot cost the caller the
+    # analysis they just paid for.
+    session.save()
+    return {"session": str(session.directory), **session.summary()}
+
+
+@mcp.tool(com_serialized=False)
+def review_schematic_session(
+    session_dir: str,
+    action: str = "summary",
+    refdes: str | None = None,
+    kind: str | None = None,
+    value: str | None = None,
+    new_refdes: str | None = None,
+    rotation: int | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    net: str | None = None,
+    points: list[list[float]] | None = None,
+    text: str | None = None,
+    replacement: str | None = None,
+    limit: int = 0,
+) -> dict[str, Any]:
+    """Inspect or correct a saved review session. Fast; never re-reads the image.
+
+    Every correction is applied to the stored plan and recorded, so a reviewer can
+    see what the analysis produced versus what was changed. The intended loop is:
+    read once, look at what was found, correct the parts that are wrong, rebuild.
+
+    ``action`` selects what to do:
+
+    ``summary``
+        counts, component kinds, and what to review next
+    ``validate``
+        build-blocking mistakes such as duplicate designators or off-page parts
+    ``components``
+        list components; ``limit`` caps the output
+    ``wires``
+        list recovered routes; ``net`` selects one, ``limit`` caps the output
+    ``move`` / ``nudge``
+        set an absolute position or apply an offset, in ``x`` and ``y``
+    ``set-kind`` / ``set-value`` / ``set-rotation`` / ``rename``
+        correct a component's classification, value, angle or name
+    ``add-component`` / ``delete``
+        add a part the analysis missed, or remove one it invented
+    ``set-wire``
+        replace a net's route with an explicit ``points`` polyline
+    ``set-text``
+        transcribe a label the analysis located but could not read
+    ``clear-warnings`` / ``overlay``
+        mark warnings reviewed, or redraw the review image
+
+    Positions and wire points are in Multisim storage units (1/96 inch). Use
+    ``build_schematic_from_session`` to write the ``.ms14`` once the review is done.
+    """
+    from multisim_mcp.schematic_image.session import ReconstructionSession
+
+    if not isinstance(session_dir, str) or not session_dir.strip():
+        raise ValueError("session_dir must not be empty")
+    session = ReconstructionSession.load(session_dir)
+    if limit < 0:
+        raise ValueError("limit must not be negative")
+
+    if action == "summary":
+        return session.summary()
+    if action == "validate":
+        return session.validate()
+    if action == "components":
+        rows = session.components(refdes=refdes)
+        if limit:
+            rows = rows[:limit]
+        return {"count": len(rows), "components": rows}
+    if action == "wires":
+        rows = [
+            {"net": wire.net, "points": [[round(a, 2), round(b, 2)] for a, b in wire.points]}
+            for wire in session.plan.wires
+            if not net or wire.net == net
+        ]
+        return {"count": len(rows), "wires": rows[: limit or len(rows)]}
+    if action == "overlay":
+        return session.render().to_dict() if hasattr(session.render(), "to_dict") else session.render()
+
+    # --- corrections
+    def need(name: str, item: Any) -> Any:
+        if item is None:
+            raise ValueError(f"action {action!r} requires {name}")
+        return item
+
+    if action == "move":
+        session.move(need("refdes", refdes), need("x", x), need("y", y))
+    elif action == "nudge":
+        session.nudge(need("refdes", refdes), need("x", x), need("y", y))
+    elif action == "set-kind":
+        session.set_kind(need("refdes", refdes), need("kind", kind))
+    elif action == "set-value":
+        session.set_value(need("refdes", refdes), need("value", value))
+    elif action == "set-rotation":
+        session.set_rotation(need("refdes", refdes), need("rotation", rotation))
+    elif action == "rename":
+        session.rename(need("refdes", refdes), need("new_refdes", new_refdes))
+    elif action == "add-component":
+        session.add_component(
+            need("refdes", refdes), need("kind", kind), need("x", x), need("y", y),
+            value=value or "",
+        )
+    elif action == "delete":
+        session.delete(need("refdes", refdes))
+    elif action == "set-wire":
+        if not points:
+            raise ValueError("action 'set-wire' requires points")
+        session.set_wire(need("net", net), points)
+    elif action == "set-text":
+        session.set_text(need("text", text), need("replacement", replacement))
+    elif action == "clear-warnings":
+        session.clear_warnings()
+    else:
+        raise ValueError(
+            f"unknown action {action!r}; use summary, validate, components, wires, "
+            "move, nudge, set-kind, set-value, set-rotation, rename, add-component, "
+            "delete, set-wire, set-text, clear-warnings or overlay"
+        )
+
+    saved = session.save()
+    return {
+        "saved": str(saved),
+        "corrections_applied": len(session.corrections),
+        **session.summary(),
+    }
+
+
+@mcp.tool(com_serialized=False)
+def build_schematic_from_session(
+    session_dir: str,
+    netlist: str,
+    output_ms14: str,
+    net_terminals: dict[str, list[list[float]]] | None = None,
+    fit_layout: bool = True,
+    power_symbols: bool = True,
+    tree_routing: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Write an ``.ms14`` from a reviewed session. Fast; never re-reads the image.
+
+    Every component position stored in the session is written literally, so the
+    generated schematic keeps the drawing's own placement rather than a heuristic
+    grid.
+
+    ``net_terminals`` maps a net name to the drawing positions of the pins on that
+    net, which lets recovered wires be attached to the right nets. Without it the
+    positions are still exact and the wiring is autorouted.
+
+    Three options turn coordinates into something that reads like a schematic:
+
+    ``fit_layout``
+        a native symbol has a fixed size, so parts placed closer than one pin pitch
+        would overlap; positions are scaled by one global factor until they clear,
+        and the sheet grows with them
+    ``power_symbols``
+        ground is drawn with a local symbol per part instead of one wire crossing
+        the sheet
+    ``tree_routing``
+        a net with three or more drops becomes a tree rather than a star
+
+    This does not start Multisim and does not open the file.
+    """
+    from multisim_mcp.schematic_image.session import ReconstructionSession
+
+    if not isinstance(netlist, str) or not netlist.strip():
+        raise ValueError("netlist must not be empty")
+    session = ReconstructionSession.load(session_dir)
+    output = Path(output_ms14).expanduser()
+    if output.suffix.lower() != ".ms14":
+        raise ValueError("output_ms14 must end with .ms14")
+    for path in (output, output.with_suffix(".xml")):
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"refusing to overwrite existing file: {path}")
+
+    terminals: dict[str, list[tuple[float, float]]] | None = None
+    if net_terminals:
+        terminals = {}
+        for name, items in net_terminals.items():
+            cleaned: list[tuple[float, float]] = []
+            for point in items:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    raise ValueError(f"net {name!r} terminals must be [x, y] pairs")
+                cleaned.append((float(point[0]), float(point[1])))
+            terminals[str(name)] = cleaned
+
+    session.directory.mkdir(parents=True, exist_ok=True)
+    session.save()
+    return session.build(
+        netlist,
+        output,
+        terminals=terminals,
+        fit_layout=bool(fit_layout),
+        power_symbols=bool(power_symbols),
+        tree_routing=bool(tree_routing),
+    )
+
+
 @mcp.tool()
 def create_schematic_from_netlist(
     netlist: str,

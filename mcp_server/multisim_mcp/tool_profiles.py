@@ -116,10 +116,23 @@ ALL_TOOL_NAMES = frozenset(
         "set_rlc_value",
         "decode_ms14",
         "encode_ms14",
+        "read_schematic_image",
+        "review_schematic_session",
+        "build_schematic_from_session",
     }
 )
 
 _COMMON = frozenset({"runtime_status", "connect", "disconnect"})
+
+#: Reading a schematic from a picture is a core circuit-intake capability, so it
+#: joins every bounded profile that can also produce a schematic.
+_SCHEMATIC_IMAGE = frozenset(
+    {
+        "read_schematic_image",
+        "review_schematic_session",
+        "build_schematic_from_session",
+    }
+)
 
 _CIRCUIT_CORE = frozenset(
     {
@@ -292,9 +305,9 @@ _OPTIMIZATION_WORKFLOW = frozenset(
 )
 
 PROFILE_TOOL_NAMES: Mapping[str, frozenset[str]] = {
-    "core": _COMMON | _CIRCUIT_CORE | _BASIC_SIMULATION,
+    "core": _COMMON | _CIRCUIT_CORE | _BASIC_SIMULATION | _SCHEMATIC_IMAGE,
     "experiment": (
-        _COMMON | _CIRCUIT_CORE | _EXPERIMENT_WORKFLOW | _ARTIFACT_WORKFLOW
+        _COMMON | _CIRCUIT_CORE | _EXPERIMENT_WORKFLOW | _ARTIFACT_WORKFLOW | _SCHEMATIC_IMAGE
     ),
     "optimization": (
         _COMMON
@@ -302,6 +315,7 @@ PROFILE_TOOL_NAMES: Mapping[str, frozenset[str]] = {
         | _OPTIMIZATION_WORKFLOW
         | _SWEEP_WORKFLOW
         | _ARTIFACT_WORKFLOW
+        | _SCHEMATIC_IMAGE
     ),
     "full": ALL_TOOL_NAMES,
 }
