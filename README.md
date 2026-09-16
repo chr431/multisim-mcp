@@ -183,6 +183,14 @@ COM worker，服务重启后未完成任务会安全地重新排队。
   CSV、SVG 和 Markdown 报告。
 - 自动生成的原理图探针暂不作为实验数据来源；实验数据来自同一网表经 Multisim
   命令引擎执行的结果。
+- 从图片读取原理图，并把量得的布局写回 `.ms14`。这是**迭代式**流程而非一次成型：
+  `read_schematic_image` 读图约 30 秒，只做一次；之后每次修正都基于已保存的
+  session，耗时约 13 毫秒，不改动图片。因此可以先看叠加图、再逐处纠正，而不必
+  要求第一次分析就完全正确。比例尺必须显式给出（`dpi`、`paper` 或
+  `page_width_mm`）——ISO A 系列图纸长宽比相同，无法从形状区分 A4 与 A0，故不会
+  静默猜测。详见
+  [`docs/SCHEMATIC_IMAGE_RECONSTRUCTION.md`](docs/SCHEMATIC_IMAGE_RECONSTRUCTION.md)。
+  该能力需要可选依赖，安装 `multisim-mcp[images]`。
 
 ## 快速开始
 
