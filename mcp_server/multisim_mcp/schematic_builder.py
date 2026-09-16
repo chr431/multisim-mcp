@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -2884,18 +2885,270 @@ def _add_virtual_instrument_state(
     instruments_data.append(state)
 
 
+def _ground_symbol_specs(
+    specs: Sequence[ComponentSpec],
+    positions: Mapping[str, Sequence[float]],
+    *,
+    occupied: Sequence[Any] = (),
+) -> tuple[list[ComponentSpec], dict[str, tuple[float, float]]]:
+    """Create one local ground symbol per grounded component.
+
+    Returns ``(extra_specs, positions)``. Each spec is a GND component whose
+    single port sits on node 0, placed clear of the part it serves, so the
+    connection is made by the symbol itself and no ground wire is needed.
+
+    A native symbol occupies roughly 126 x 108 storage units, so "clear" has to
+    exceed that in at least one axis; a smaller clearance still trips the geometry
+    validator with a component-overlap finding. Candidate offsets are tried
+    outward from the part -- below it first, since a ground symbol
+    conventionally hangs down -- and the conventional spot is kept if everything
+    nearby is taken, so a part is never left ungrounded.
+    """
+    taken: list[tuple[float, float]] = []
+    for item in occupied:
+        if isinstance(item, Mapping) and "x" in item and "y" in item:
+            taken.append((float(item["x"]), float(item["y"])))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                taken.append((float(item[0]), float(item[1])))
+            except (TypeError, ValueError):
+                continue
+
+    def free(x: float, y: float, dx: float = 150.0, dy: float = 132.0) -> bool:
+        return all(abs(x - ox) >= dx or abs(y - oy) >= dy for ox, oy in taken)
+
+    extra: list[ComponentSpec] = []
+    out: dict[str, tuple[float, float]] = {}
+    offsets = (
+        (0.0, 132.0),
+        (-150.0, 132.0),
+        (150.0, 132.0),
+        (-150.0, 0.0),
+        (150.0, 0.0),
+        (0.0, 264.0),
+        (-150.0, 264.0),
+        (150.0, 264.0),
+        (0.0, -132.0),
+        (-150.0, -132.0),
+        (150.0, -132.0),
+        (0.0, 396.0),
+        (-300.0, 0.0),
+        (300.0, 0.0),
+    )
+    counter = 0
+    for spec in specs:
+        if spec.kind == "GND":
+            continue
+        if not any(_normalize_net(node)[0] == "0" for node in spec.nodes):
+            continue
+        base = positions.get(spec.refdes)
+        if base is None or len(base) < 2:
+            # Without a known position the symbol cannot be placed locally; the
+            # caller keeps the wire for this part instead of guessing a spot.
+            continue
+        bx, by = float(base[0]), float(base[1])
+        chosen = next(
+            ((bx + dx, by + dy) for dx, dy in offsets if free(bx + dx, by + dy)),
+            (bx, by + 132.0),
+        )
+        counter += 1
+        refdes = f"GND{counter}"
+        out[refdes] = chosen
+        taken.append(chosen)
+        extra.append(ComponentSpec(kind="GND", refdes=refdes, nodes=["0"]))
+    return extra, out
+
+
+def _path_is_clear(
+    path: Sequence[tuple[float, float]],
+    obstacles: Sequence[Mapping[str, Any]],
+    start: Mapping[str, Any],
+    end: Mapping[str, Any],
+) -> bool:
+    """Return whether every segment of ``path`` avoids the other components.
+
+    The two endpoints belong to the wire's own pins, so their owners are exempt:
+    a wire legitimately touches the parts it connects.
+    """
+    own = {start.get("refdes"), end.get("refdes")}
+    for a, b in zip(path, path[1:]):
+        if abs(a[0] - b[0]) > 0.01 and abs(a[1] - b[1]) > 0.01:
+            return False  # not axis-aligned
+        for obstacle in obstacles:
+            if obstacle.get("refdes") in own:
+                continue
+            try:
+                x0 = float(obstacle["x"])
+                y0 = float(obstacle["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            width = float(obstacle.get("width", 126.0))
+            height = float(obstacle.get("height", 108.0))
+            x1, y1 = x0 + width, y0 + height
+            lo_x, hi_x = min(a[0], b[0]), max(a[0], b[0])
+            lo_y, hi_y = min(a[1], b[1]), max(a[1], b[1])
+            # A segment inside the box, or crossing it, means the route is blocked.
+            if lo_x < x1 and hi_x > x0 and lo_y < y1 and hi_y > y0:
+                return False
+    return True
+
+
+def _simplify_orthogonal(
+    points: Sequence[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Drop duplicate and collinear points from an axis-aligned polyline."""
+    cleaned: list[tuple[float, float]] = []
+    for point in points:
+        if cleaned and cleaned[-1] == point:
+            continue
+        cleaned.append((float(point[0]), float(point[1])))
+    if len(cleaned) < 3:
+        return cleaned
+    out: list[tuple[float, float]] = [cleaned[0]]
+    for point in cleaned[1:]:
+        while len(out) >= 2:
+            a, b = out[-2], out[-1]
+            if (a[0] == b[0] == point[0]) or (a[1] == b[1] == point[1]):
+                out.pop()
+            else:
+                break
+        out.append(point)
+    return out
+
+
+def _tree_corner(
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[float, float]:
+    """Return the single corner of an L-shaped branch between two points.
+
+    The leg along the dominant axis is emitted first, which is what makes a tree
+    read as a trunk with branches rather than as arbitrary dog-legs.
+    """
+    dx = abs(end[0] - start[0])
+    dy = abs(end[1] - start[1])
+    if dx >= dy:
+        return (end[0], start[1])
+    return (start[0], end[1])
+
+
+def _tree_edges(
+    points: Sequence[tuple[float, float]],
+) -> list[tuple[int, int]]:
+    """Return minimum-spanning-tree edges over terminal indices.
+
+    Prim's algorithm with Manhattan distance, which is the metric that matches
+    axis-aligned wiring. O(n^2) is ample for a net's terminal count.
+    """
+    count = len(points)
+    if count < 2:
+        return []
+
+    def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    in_tree = [False] * count
+    best = [float("inf")] * count
+    parent = [-1] * count
+    in_tree[0] = True
+    for index in range(1, count):
+        best[index] = distance(points[0], points[index])
+        parent[index] = 0
+    edges: list[tuple[int, int]] = []
+    for _ in range(count - 1):
+        candidate = -1
+        for index in range(count):
+            if not in_tree[index] and (candidate < 0 or best[index] < best[candidate]):
+                candidate = index
+        if candidate < 0 or best[candidate] == float("inf"):
+            break
+        in_tree[candidate] = True
+        edges.append((parent[candidate], candidate))
+        for index in range(count):
+            if in_tree[index]:
+                continue
+            value = distance(points[candidate], points[index])
+            if value < best[index]:
+                best[index] = value
+                parent[index] = candidate
+    return edges
+
+
+def _anchor_route(
+    prescribed: Sequence[Sequence[float]],
+    start: Mapping[str, Any],
+    end: Mapping[str, Any],
+) -> list[tuple[float, float]]:
+    """Return a measured polyline with its ends joined to the actual pins.
+
+    A route recovered from a picture is authoritative in the middle, but its
+    endpoints may be a grid step away from where the builder finally placed the
+    two pins. Rectilinear stubs are therefore added at each end so the wire still
+    lands exactly on both ports and every segment stays axis-aligned.
+    """
+    points: list[tuple[float, float]] = [
+        (float(point[0]), float(point[1])) for point in prescribed
+    ]
+    start_point = (float(start["x"]), float(start["y"]))
+    end_point = (float(end["x"]), float(end["y"]))
+
+    if points[0] != start_point:
+        points.insert(0, (start_point[0], points[0][1]))
+        points.insert(0, start_point)
+    if points[-1] != end_point:
+        points.append((points[-1][0], end_point[1]))
+        points.append(end_point)
+    return _simplify_orthogonal(points)
+
+
 def build_schematic(
     netlist: str,
     output_path: str | Path,
     template_path: str | Path | None = None,
     probe_nets: list[str] | None = None,
+    explicit_positions: Mapping[str, Sequence[float]] | None = None,
+    explicit_routes: Mapping[str, Sequence[Sequence[float]]] | None = None,
+    preserve_layout: bool = False,
+    power_symbols: bool = False,
+    tree_routing: bool = False,
 ) -> dict[str, Any]:
     """Build an editable Multisim XML design from a simple SPICE netlist.
 
     ``probe_nets`` names the nets that should get voltage probes. When omitted,
     the last non-ground net is probed automatically. Set it to an empty list to
     disable probes.
+
+    ``explicit_positions`` maps a reference designator to an ``(x, y)`` position
+    in Multisim storage units (1/96 inch; see
+    :mod:`multisim_mcp.schematic_image.units`). Every entry is honoured verbatim
+    and takes precedence over the built-in layout profiles, which is what makes
+    it possible to reproduce a layout that was measured rather than guessed.
+
+    ``preserve_layout`` skips the automatic layout entirely and places only what
+    ``explicit_positions`` names. Anything not named keeps the profile's own
+    position rather than being moved, so a partially specified layout is
+    completed rather than overridden.
+
+    ``explicit_routes`` maps a net name to a polyline that replaces the
+    autorouter's result for that net. This is how a wire path recovered from a
+    picture is reproduced exactly.
+
+    ``power_symbols`` replaces the single global ground with one local ground
+    symbol per grounded part, placed beside it. The ground net then needs no
+    wiring at all, which is how hand-drawn schematics avoid a ground line
+    crossing the whole sheet.
+
+    ``tree_routing`` draws a net with three or more drops as a rectilinear
+    minimum spanning tree with L-shaped branches, instead of routing every drop
+    to one shared point. It is off by default because the built-in layout
+    profiles were tuned against the star router; it is intended for the explicit
+    layout path.
     """
+    explicit_positions = dict(explicit_positions or {})
+    explicit_routes = {
+        str(name): [tuple(float(value) for value in point) for point in path]
+        for name, path in (explicit_routes or {}).items()
+    }
     parsed = parse_netlist(netlist)
     inductor_refs = {
         spec.refdes.lower() for spec in parsed.components if spec.kind == "L"
@@ -2943,6 +3196,23 @@ def build_schematic(
     specs = list(parsed.components)
     if parsed.grounded:
         specs.append(ComponentSpec(kind="GND", refdes="0", nodes=["0"]))
+
+    # --- Local ground symbols, optionally. A schematic normally avoids running a
+    # ground wire across the whole sheet by placing a small ground symbol at each
+    # point that needs one; a real reconstruction attempt measured its ground run
+    # dropping from 221 segments to 143 after doing this by hand. When requested,
+    # the single global ground becomes one local symbol per grounded part and the
+    # ground net then needs no wiring at all.
+    if power_symbols:
+        extra_ground, ground_positions = _ground_symbol_specs(
+            specs,
+            explicit_positions,
+            occupied=list(explicit_positions.items()),
+        )
+        if extra_ground:
+            specs = [item for item in specs if item.kind != "GND"]
+            specs.extend(extra_ground)
+            explicit_positions = {**explicit_positions, **ground_positions}
 
     grid_columns = min(6, max(2, math.ceil(math.sqrt(max(1, len(specs))))))
     grid_origin_x = 36
@@ -3022,7 +3292,21 @@ def build_schematic(
         rank = placement_rank[component_index]
         x = grid_origin_x + (rank % grid_columns) * grid_step_x
         y = grid_origin_y + (rank // grid_columns) * grid_step_y
-        if simple_profile:
+        if preserve_layout and not explicit_positions:
+            raise ValueError(
+                "preserve_layout requires explicit_positions; without them there "
+                "is nothing to preserve and no part would be placed"
+            )
+        explicit = explicit_positions.get(spec.refdes)
+        if explicit is not None:
+            # A measured position is honoured verbatim. It came from a drawing,
+            # not from a heuristic, so no profile or grid may move it.
+            if len(explicit) < 2:
+                raise ValueError(
+                    f"explicit position for {spec.refdes} needs an x and a y"
+                )
+            x, y = float(explicit[0]), float(explicit[1])
+        elif simple_profile:
             x, y = simple_profile['positions'][spec.refdes]
         elif opamp_profile:
             x, y = opamp_profile['positions'][spec.refdes]
@@ -3187,6 +3471,11 @@ def build_schematic(
     for name, conns in connections.items():
         if len(conns) < 2:
             continue
+        if power_symbols and _normalize_net(name)[0] == "0":
+            # The ground net is realised by local symbols, one beside each part,
+            # so it needs no wires. Emitting them anyway would draw the long
+            # ground run that those symbols exist to avoid.
+            continue
         routing_obstacles = list(placements)
         # Reserve every other net's pin escape before routing the first net.
         # Otherwise an early supply wire can occupy a later signal's only exit.
@@ -3214,7 +3503,13 @@ def build_schematic(
         node_text.set("Transformer-M21", f"{mid_y:g}")
         _clear(node_text.find("./Links"))
 
-        def add_wire(start: dict[str, Any], end: dict[str, Any], end_id: str) -> None:
+        def add_wire(
+            start: dict[str, Any],
+            end: dict[str, Any],
+            end_id: str,
+            *,
+            via: Any = None,
+        ) -> None:
             wire_item = _wire_item(named=True)
             _remap_subtree(wire_item, ids)
             wire = wire_item.find("./CIITLinkComp")
@@ -3226,7 +3521,42 @@ def build_schematic(
             _clear(points)
             occupied = [segment for other, paths in net_wires.items() if other != name
                         for path in paths for segment in zip(path, path[1:])]
-            path = route_pins(start, end, routing_obstacles, occupied)
+            if via is not None:
+                # A tree branch: leave each pin along its own lead direction,
+                # then join the two escape points with a single L. Going straight
+                # from pin to pin would cut through the symbol bodies, which is
+                # what the pin-escape step exists to prevent, so the escapes come
+                # from the same helper the router uses.
+                #
+                # The L is only used when it is actually clear. An escape point
+                # can land on the far side of its own component when the wire has
+                # to leave in an unusual direction, and the L would then run back
+                # through the part. In that case the proven router takes over, so
+                # a tree branch is never worse than the star it replaces.
+                start_point = (float(start["x"]), float(start["y"]))
+                end_point = (float(end["x"]), float(end["y"]))
+                start_escape = pin_escape(start, routing_obstacles)
+                end_escape = pin_escape(end, routing_obstacles)
+                corner = _tree_corner(start_escape, end_escape)
+                candidate = _simplify_orthogonal(
+                    [start_point, start_escape, corner, end_escape, end_point]
+                )
+                if _path_is_clear(candidate, routing_obstacles, start, end):
+                    path = candidate
+                else:
+                    path = route_pins(start, end, routing_obstacles, occupied)
+            else:
+                prescribed = explicit_routes.get(name)
+                if prescribed and len(prescribed) >= 2 and len(conns) == 2:
+                    # A measured route: reproduce it exactly, but still anchor its
+                    # ends on the two pin positions so the net stays connected. A
+                    # prescribed route describes one wire, so it applies only to
+                    # nets that are exactly one wire; a multi-drop net needs a
+                    # trunk-and-branch decomposition the caller has not supplied,
+                    # and misapplying it would emit overlapping wires.
+                    path = _anchor_route(prescribed, start, end)
+                else:
+                    path = route_pins(start, end, routing_obstacles, occupied)
             for px, py in path:
                 points.append(ET.Element("Item", {"X": f"{px:g}", "Y": f"{py:g}"}))
             modifier = wire.find("./ElectricalObject/ModifierInfo/Element")
@@ -3248,6 +3578,26 @@ def build_schematic(
         if len(conns) == 2:
             first, second = conns
             add_wire(first, second, second["extpin_id"])
+        elif tree_routing:
+            # A net with three or more drops is normally drawn as a star: every
+            # pin gets a wire to one shared junction. That is electrically right
+            # but looks nothing like a hand-drawn schematic, where a signal is a
+            # trunk with short right-angled branches, and on a net with many
+            # drops the star also emits many long overlapping wires. A rectilinear
+            # minimum spanning tree gives the trunk-and-branch shape at roughly
+            # four fifths of the wire length.
+            #
+            # This replaces the star rather than supplementing it: emitting both
+            # would double-connect the net and collide the two wirings.
+            #
+            # The corner is NOT computed here. Each branch leaves its pin along
+            # that pin's own lead direction first, so the corner between the two
+            # *escape* points is the only one that keeps the wire clear of the
+            # symbol bodies; computing it from the pin centres instead produces a
+            # dog-leg that cuts back through the part it just left.
+            for left, right in _tree_edges([(float(c["x"]), float(c["y"])) for c in conns]):
+                start_conn, end_conn = conns[left], conns[right]
+                add_wire(start_conn, end_conn, end_conn["extpin_id"], via="escape")
         else:
             jx = sum(c["x"] for c in conns) / len(conns)
             jy = sum(c["y"] for c in conns) / len(conns)
