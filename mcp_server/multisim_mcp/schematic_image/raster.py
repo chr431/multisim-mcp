@@ -711,32 +711,60 @@ def separate_shared_roles(
     dot_max_px: float,
     min_chain_px: float,
     thin_max_px: float = 8.0,
+    split_wire_text: bool = True,
+    text_span_px: float | None = None,
 ) -> dict[str, Any]:
     """Split colours that carry several roles, using geometry.
 
-    Two ambiguities occur in real exports:
+    Three ambiguities occur in real exports:
+
+    ``wire`` vs ``text``
+        Several drawings in this family render the reference designators, the
+        values *and* the wiring in one navy. On such a sheet colour carries no
+        information at all about which is which, and only shape separates them: a
+        wire is one long thin blob while a label is a cluster of small blobs of
+        equal height sitting in a row.
+
+        This is not a refinement. Applied to a real sheet with roughly 150
+        components, treating navy as wiring only found 30, because the anchor
+        search could not see the labels and the vectoriser saw the labels as
+        wiring -- 3837 spurious "nets" where 415 wires exist.
 
     ``value`` vs ``region``
-        Both are drawn in the same colour.  Value text consists of many small
+        Both are drawn in the same colour. Value text consists of many small
         glyphs packed tightly together; a dashed enclosure is a long run of
         near-identical dashes evenly spaced along a line *and* a coincident run
-        of dots along the perpendicular.  Detecting those two perpendicular
+        of dots along the perpendicular. Detecting those two perpendicular
         dash-runs identifies a box with no risk of mistaking text for one.
 
     ``wire`` vs ``pin``
-        A pin stub is a short stroke.  Classifying it needs the grid pitch, so
-        the wire layer does it instead; this function only records the raw masks.
+        A pin stub is a short stroke. Classifying it needs the grid pitch, so the
+        wire layer does it instead; this function only records the raw masks.
 
     The result is stored in :attr:`RoleIndex.secondary`, which :meth:`RoleIndex.mask`
-    consults first.  Returns a small report describing what was split.
+    consults first. Returns a small report describing what was split.
     """
     numpy = _require_numpy()
     report: dict[str, Any] = {}
 
-    from .palette import ROLE_REGION, ROLE_VALUE  # noqa: PLC0415
+    from .palette import ROLE_REGION, ROLE_TEXT, ROLE_VALUE, ROLE_WIRE  # noqa: PLC0415
+
+    if split_wire_text and index.image is not None:
+        # The wire colour, taken from the palette so a custom scheme still works.
+        joined = index.primary_mask(ROLE_WIRE) | index.primary_mask(ROLE_TEXT)
+        if joined.any():
+            span = text_span_px if text_span_px is not None else _estimate_text_span(joined)
+            text, wire, stats = _split_text_from_wire(joined, text_span_px=span)
+            index.secondary[ROLE_TEXT] = text
+            index.secondary[ROLE_WIRE] = wire
+            report["text_from_wire"] = stats
 
     if ROLE_VALUE in index.roles and ROLE_REGION in index.roles:
-        shared = index.primary_mask(ROLE_VALUE)
+        # Both roles share one colour, and the per-pixel classifier can only award
+        # it to one of them. Take the union of both primary masks as the shared
+        # set, then separate it -- reading only ROLE_VALUE would leave the region
+        # pixels on the wrong side of the split.
+        shared = index.primary_mask(ROLE_VALUE) | index.primary_mask(ROLE_REGION)
         if shared.any():
             dashed = _dashed_box_mask(
                 shared,
@@ -764,6 +792,104 @@ def _runs_with_extent(mask: Any, axis: int) -> list[tuple[int, int, int]]:
     lines, starts = numpy.nonzero(diff == 1)
     _, ends = numpy.nonzero(diff == -1)
     return list(zip(lines.tolist(), starts.tolist(), ends.tolist()))
+
+
+def _estimate_text_span(joined: Any) -> float:
+    """Estimate the longest blob dimension still plausibly part of a glyph.
+
+    Called on a mask that mixes wiring with labels. Wiring blobs are very long;
+    glyph blobs are short. The distribution is therefore bimodal, and the split
+    point is taken from the low mode rather than from an absolute constant, so it
+    adapts to the drawing's text size and export resolution.
+    """
+    numpy = _require_numpy()
+    imaging = _import_imaging()
+    labels, count = imaging.label_components(joined, connectivity=8)
+    if count == 0:
+        return 40.0
+    boxes = imaging.component_boxes(labels, count)
+    spans = [
+        max(box[2] - box[0], box[3] - box[1])
+        for box in boxes
+        if box is not None
+    ]
+    if not spans:
+        return 40.0
+    values = numpy.array(spans, dtype=float)
+    short = values[values <= numpy.percentile(values, 70)]
+    if short.size == 0:
+        return 40.0
+    # Glyphs cluster tightly; take the top of that cluster and leave headroom for
+    # wide labels such as a part number.
+    typical = float(numpy.percentile(short, 90))
+    return max(12.0, typical * 3.0)
+
+
+def _split_text_from_wire(
+    joined: Any,
+    *,
+    text_span_px: float,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Split one colour into glyph blobs and wiring blobs.
+
+    The discriminator is size and shape alone, because on these drawings colour
+    cannot help:
+
+    * a blob whose longest side exceeds ``text_span_px`` is wiring;
+    * a blob that is long in one axis and a few pixels in the other is wiring;
+    * a compact blob is a glyph.
+
+    Everything else is decided by connected-component extent, so a label touching
+    a wire is the one case that needs care: the merged blob is large, so it would
+    classify as wiring and the label would be lost. That is handled by *not*
+    merging in the first place where possible -- labels are drawn clear of the
+    wires they annotate -- and by reporting the count so a caller can see the
+    balance.
+    """
+    numpy = _require_numpy()
+    imaging = _import_imaging()
+    labels, count = imaging.label_components(joined, connectivity=8)
+    if count == 0:
+        empty = numpy.zeros(joined.shape, dtype=bool)
+        return empty, empty, {"glyph_blobs": 0, "wire_blobs": 0, "text_span_px": text_span_px}
+
+    boxes = imaging.component_boxes(labels, count)
+    wire_ids: list[int] = []
+    glyph_ids: list[int] = []
+    for index in range(1, count + 1):
+        box = boxes[index - 1]
+        if box is None:
+            continue
+        width = box[2] - box[0]
+        height = box[3] - box[1]
+        longest = max(width, height)
+        shortest = max(1, min(width, height))
+        # Wiring: long overall, or a long thin stroke.
+        if longest > text_span_px or (longest > 3 * shortest and longest > 24):
+            wire_ids.append(index)
+        else:
+            glyph_ids.append(index)
+
+    lookup = numpy.zeros(count + 1, dtype=numpy.uint8)
+    if wire_ids:
+        lookup[numpy.array(wire_ids, dtype=numpy.int64)] = 1
+    if glyph_ids:
+        lookup[numpy.array(glyph_ids, dtype=numpy.int64)] = 2
+    classified = lookup[labels]
+    text = classified == 2
+    wire = classified == 1
+    return text, wire, {
+        "glyph_blobs": len(glyph_ids),
+        "wire_blobs": len(wire_ids),
+        "text_span_px": round(float(text_span_px), 2),
+    }
+
+
+def _import_imaging():
+    """The numpy-only image primitives, imported lazily."""
+    from . import _imaging  # noqa: PLC0415 - local helpers
+
+    return _imaging
 
 
 def _dashed_box_mask(

@@ -147,11 +147,15 @@ class ReconstructionSession:
             "schema_version": SNAPSHOT_VERSION,
             "plan": self.plan.to_dict(),
             "report": {
-                # The report is large; keep the parts a reviewer needs and drop
-                # the full component and wire dumps, which the plan already holds.
+                # Keep everything a reviewer needs and drop only the bulk dumps the
+                # plan already carries. ``labels`` must be KEPT: it holds the exact
+                # pixel rectangles of every label the analysis located, which is
+                # what makes transcription possible. Dropping it left a session
+                # whose summary said "86 labels are unread" while offering no way
+                # to find out where they are, so the reading workflow was unusable.
                 key: value
                 for key, value in self.report.items()
-                if key not in {"plan", "components", "wires", "symbols", "labels"}
+                if key not in {"plan", "components", "wires", "symbols"}
             },
             "corrections": [item.to_dict() for item in self.corrections],
         }
@@ -460,6 +464,66 @@ class ReconstructionSession:
         destination = Path(output_png) if output_png else self.directory / "overlay.png"
         result = render_overlay(source, self.plan, destination)
         return result.to_dict()
+
+    def labels(self, *, kind: str | None = None, limit: int = 0) -> list[dict[str, Any]]:
+        """Return the label rectangles the analysis located.
+
+        These are the *text* boxes, not components: on a drawing that renders
+        designators and values in the same colour there is no way to tell them
+        apart without reading them. That is the transcription task, and this is
+        the list it works from -- each entry carries its pixel rectangle, its
+        position, and how big it is, which is usually enough to tell a short
+        designator from a long part number before reading a single glyph.
+
+        ``kind`` filters by what the analysis guessed (``refdes``/``value``/
+        ``pin``); the guess is by colour, so treat it as a hint only.
+        """
+        regions = (self.report.get("labels") or {}).get("regions") or []
+        rows: list[dict[str, Any]] = []
+        for region in regions:
+            if kind and region.get("kind") != kind:
+                continue
+            rows.append(dict(region))
+        return rows[: limit or len(rows)]
+
+    def label_clusters(self, *, limit: int = 0) -> list[dict[str, Any]]:
+        """Group labels by visual signature, largest group first.
+
+        Two labels share a signature when they render the same string, so reading
+        one covers both. Measured on a real 392-label sheet this collapsed them to
+        327 groups: most labels are unique, because a designator such as ``R31``
+        appears once. The grouping therefore helps with repeated values (``100nF``
+        and ``NC`` recur) but it is not the shortcut it was originally assumed to
+        be -- transcribing a dense sheet is genuinely several hundred readings.
+        """
+        rows: list[dict[str, Any]] = []
+        for region in self.labels():
+            centre = region.get("centre") or [0, 0]
+            rows.append(
+                {
+                    "cluster": region.get("cluster"),
+                    "kind": region.get("kind"),
+                    "size": region.get("size"),
+                    "centre": centre,
+                    "x": centre[0],
+                    "y": centre[1],
+                }
+            )
+        grouped: dict[Any, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(row["cluster"], []).append(row)
+        out = [
+            {
+                "cluster": cluster,
+                "count": len(members),
+                "kind": members[0]["kind"],
+                "size": members[0]["size"],
+                "centre": members[0]["centre"],
+            }
+            for cluster, members in grouped.items()
+        ]
+        out.sort(key=lambda item: -item["count"])
+        return out[: limit or len(out)]
 
     def check_against_netlist(self, netlist: str) -> dict[str, Any]:
         """Report whether the plan's names line up with a netlist.

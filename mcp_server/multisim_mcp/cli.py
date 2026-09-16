@@ -3186,6 +3186,17 @@ def build_parser() -> argparse.ArgumentParser:
     review_wires.add_argument("--net", help="only this net")
     review_wires.add_argument("--limit", type=int, default=20, help="cap the list")
 
+    review_labels = review_actions.add_parser(
+        "labels",
+        help="list the label rectangles found, so they can be transcribed",
+    )
+    review_labels.add_argument("--kind", help="refdes, value or pin")
+    review_labels.add_argument("--limit", type=int, default=0, help="cap the list (0 = all)")
+    review_labels.add_argument(
+        "--clusters", action="store_true",
+        help="group visually identical labels so one reading covers every occurrence",
+    )
+
     for name, help_text in (
         ("move", "move a component to an absolute position"),
         ("nudge", "move a component by a relative offset"),
@@ -3337,6 +3348,12 @@ def _schematic_review_command(args: Any) -> dict[str, Any]:
                 }
             )
         return {"count": len(rows), "wires": rows[: max(1, args.limit)]}
+    if action == "labels":
+        if getattr(args, "clusters", False):
+            rows = session.label_clusters(limit=max(0, args.limit))
+            return {"count": len(rows), "clusters": rows}
+        rows = session.labels(kind=args.kind, limit=max(0, args.limit))
+        return {"count": len(rows), "labels": rows}
     if action == "move":
         session.move(args.refdes, args.x, args.y)
     elif action == "nudge":
@@ -3449,6 +3466,19 @@ def _print_schematic_review(action: str | None, result: dict[str, Any]) -> None:
             more = f" ... (+{len(points) - 4})" if len(points) > 4 else ""
             print(f"  {row.get('net'):8s} {len(points):3d} pts  {head}{more}")
         print(f"  {result.get('count')} wire(s)")
+        return
+    if action == "labels":
+        for row in result.get("clusters") or []:
+            print(
+                f"  cluster {row.get('cluster'):>5}  x{row.get('count'):>3}  "
+                f"{row.get('kind')}  size {row.get('size')}  at {row.get('centre')}"
+            )
+        for row in result.get("labels") or []:
+            print(
+                f"  {str(row.get('kind')):6s} bbox={row.get('bbox')} "
+                f"size={row.get('size')} cluster={row.get('cluster')}"
+            )
+        print(f"  {result.get('count')} item(s)")
         return
     if "ms14" in result:
         print(result["ms14"])

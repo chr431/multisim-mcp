@@ -111,13 +111,14 @@ def split_label_lines(
     max_height_px: int,
     line_gap_px: int,
     word_gap_px: int,
+    max_line_gap_px: int | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Split a text-colour mask into per-line bounding boxes.
 
-    Glyphs are grouped into lines by their vertical overlap, then each line is
-    split into words on horizontal gaps wider than ``word_gap_px``; the words of
-    one line are returned as a single box because a label such as ``6.3~30pF``
-    must stay one string.
+    Glyphs are grouped into a box when they share a baseline and are horizontally
+    close; ``max_line_gap_px`` bounds that gap so two unrelated labels on the same
+    row do not merge into one. The words of one label are returned as a single box
+    because ``6.3~30pF`` must stay one string.
     """
     imaging = _imaging()
     if mask.dtype != bool:
@@ -128,6 +129,11 @@ def split_label_lines(
     if count == 0:
         return []
     boxes = imaging.component_boxes(labels, count)
+    # A label's internal gaps are a fraction of its glyph height; the gap between
+    # two labels is larger. Without this bound, line merging joins every label on
+    # a row into one sheet-wide box.
+    if max_line_gap_px is None:
+        max_line_gap_px = max(word_gap_px * 3, word_gap_px + 2)
     raw: list[tuple[int, int, int, int]] = []
     for box in boxes:
         if box is None:
@@ -142,7 +148,14 @@ def split_label_lines(
     if not raw:
         return []
 
-    # Merge boxes that share a baseline and are close together.
+    # Merge boxes that share a baseline AND are horizontally close.
+    #
+    # The horizontal test is not optional. Without it every label sitting on the
+    # same row merges into one box spanning the whole sheet -- measured widths of
+    # 440 to 4974 px on a sheet whose labels are about 200 px wide -- and the
+    # component search then rejects the merged box as too wide, so it finds a
+    # small fraction of the parts. `max_line_gap_px` bounds a single label's
+    # internal character gaps; anything wider is a different label.
     raw.sort(key=lambda box: (box[1], box[0]))
     lines: list[list[int]] = []
     for box in raw:
@@ -150,13 +163,17 @@ def split_label_lines(
         for line in lines:
             ly0, ly1 = line[1], line[3]
             overlap = min(ly1, box[3]) - max(ly0, box[1])
-            if overlap >= 0.55 * min(ly1 - ly0, box[3] - box[1]):
-                line[0] = min(line[0], box[0])
-                line[1] = min(line[1], box[1])
-                line[2] = max(line[2], box[2])
-                line[3] = max(line[3], box[3])
-                placed = True
-                break
+            if overlap < 0.55 * min(ly1 - ly0, box[3] - box[1]):
+                continue
+            gap = box[0] - line[2] if box[0] > line[2] else line[0] - box[2]
+            if gap > max_line_gap_px:
+                continue
+            line[0] = min(line[0], box[0])
+            line[1] = min(line[1], box[1])
+            line[2] = max(line[2], box[2])
+            line[3] = max(line[3], box[3])
+            placed = True
+            break
         if not placed:
             lines.append(list(box))
     return [tuple(line) for line in lines]  # type: ignore[misc]
@@ -256,18 +273,35 @@ def extract_text_regions(
         wanted[role] = (colour, max(tolerance, 40))
 
     regions: list[TextRegion] = []
-    word_gap = max(3, int(round(0.22 * grid_px)))
     for role, (colour, tolerance) in wanted.items():
-        mask = index.near_mask(colour, tolerance) if index.image is not None else index.mask(role)
+        if index.image is not None:
+            # If the drawing renders this role in a colour it shares with something
+            # else -- labels drawn in the wire colour is the common case -- the
+            # structural split in ``separate_shared_roles`` has already decided
+            # which pixels are text, so use that rather than re-deriving it from
+            # colour. Reading colour alone here would re-admit the wiring.
+            refined = index.secondary.get(role)
+            mask = refined if refined is not None else index.near_mask(colour, tolerance)
+        else:
+            mask = index.mask(role)
         if not mask.any():
             continue
         low, high = height_bounds or estimate_text_height(mask, grid_px=grid_px)
+        # Character spacing scales with the text, not with the schematic grid. A
+        # label's glyphs are separated by roughly a fifth of their height, and two
+        # separate labels are much further apart than that. Deriving the gap from
+        # the measured text height is what keeps a label together without welding
+        # its neighbours to it; a fixed fraction of the grid pitch was small enough
+        # that individual characters stayed separate.
+        glyph_height = max(6, (low + high) // 2)
+        word_gap = max(3, int(round(0.45 * glyph_height)))
         boxes = split_label_lines(
             mask,
             min_height_px=low,
             max_height_px=high,
-            line_gap_px=max(2, int(round(0.15 * grid_px))),
+            line_gap_px=max(2, int(round(0.15 * glyph_height))),
             word_gap_px=word_gap,
+            max_line_gap_px=max(word_gap * 3, int(round(1.4 * glyph_height))),
         )
         for box in boxes:
             regions.append(
