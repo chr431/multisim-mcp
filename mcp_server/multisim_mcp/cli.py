@@ -3115,7 +3115,344 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a JSON result envelope",
     )
+
+    # --- Read a schematic from a picture, then refine it cheaply ---------------
+    # The two halves are separate on purpose. Reading the image is slow and only
+    # needs doing once; correcting the result is fast and is where a caller will
+    # spend most of their time. "schematic-review" is the fast half.
+    schematic_read = subparsers.add_parser(
+        "schematic-read",
+        help="read a schematic supplied as a picture and save a review session",
+        description=(
+            "Analyse a PNG/JPEG schematic export, scan or screenshot. This is the "
+            "slow step and is done once; every later correction uses "
+            "schematic-review on the saved session."
+        ),
+    )
+    schematic_read.add_argument("image", help="PNG/JPEG schematic export or scan")
+    schematic_read.add_argument(
+        "--session",
+        required=True,
+        help="directory to store the review session in",
+    )
+    schematic_read.add_argument(
+        "--dpi",
+        type=float,
+        help=(
+            "export resolution of the image. Every ISO A-series sheet shares one "
+            "aspect ratio, so this is the only unambiguous way to fix the scale"
+        ),
+    )
+    schematic_read.add_argument("--paper", help="paper size, e.g. A1")
+    schematic_read.add_argument(
+        "--page-width-mm", type=float, dest="page_width_mm",
+        help="physical page width in millimetres",
+    )
+    schematic_read.add_argument(
+        "--downscale", type=int, default=2,
+        help="analyse a reduced copy (default 2); nearest-neighbour, so the palette is exact",
+    )
+    schematic_read.add_argument(
+        "--overlay", nargs="?", const="", dest="overlay",
+        help="also render a review overlay PNG (default: <session>/overlay.png)",
+    )
+    schematic_read.add_argument(
+        "--json", dest="json_command", action="store_true",
+        help="emit the analysis summary as JSON",
+    )
+
+    schematic_review = subparsers.add_parser(
+        "schematic-review",
+        help="inspect and correct a saved review session without re-reading the image",
+        description=(
+            "Every correction is applied to the saved session and is fast, so a "
+            "drawing can be refined over many small steps instead of needing to be "
+            "read correctly in one pass."
+        ),
+    )
+    schematic_review.add_argument("--session", required=True, help="review session directory")
+    review_actions = schematic_review.add_subparsers(dest="action")
+
+    review_actions.add_parser("summary", help="report what the session currently holds")
+    review_actions.add_parser("validate", help="check the plan for build-blocking mistakes")
+
+    review_list = review_actions.add_parser("components", help="list components")
+    review_list.add_argument("--refdes", help="only this reference designator")
+    review_list.add_argument("--low-confidence", action="store_true",
+                             help="only components the analysis was unsure about")
+    review_list.add_argument("--limit", type=int, default=0, help="cap the list (0 = all)")
+
+    review_wires = review_actions.add_parser("wires", help="list recovered wires")
+    review_wires.add_argument("--net", help="only this net")
+    review_wires.add_argument("--limit", type=int, default=20, help="cap the list")
+
+    for name, help_text in (
+        ("move", "move a component to an absolute position"),
+        ("nudge", "move a component by a relative offset"),
+    ):
+        action = review_actions.add_parser(name, help=help_text)
+        action.add_argument("refdes")
+        action.add_argument("x", type=float)
+        action.add_argument("y", type=float)
+
+    kind_action = review_actions.add_parser("set-kind", help="set a component's kind")
+    kind_action.add_argument("refdes")
+    kind_action.add_argument("kind")
+
+    value_action = review_actions.add_parser("set-value", help="set a component's value")
+    value_action.add_argument("refdes")
+    value_action.add_argument("value")
+
+    rename_action = review_actions.add_parser("rename", help="rename a component")
+    rename_action.add_argument("refdes")
+    rename_action.add_argument("new_refdes")
+
+    rotate_action = review_actions.add_parser("set-rotation", help="rotate a component")
+    rotate_action.add_argument("refdes")
+    rotate_action.add_argument("degrees", type=int)
+
+    delete_action = review_actions.add_parser("delete", help="remove a component")
+    delete_action.add_argument("refdes")
+
+    add_action = review_actions.add_parser("add-component", help="add a missed component")
+    add_action.add_argument("refdes")
+    add_action.add_argument("kind")
+    add_action.add_argument("x", type=float)
+    add_action.add_argument("y", type=float)
+    add_action.add_argument("--value", default="")
+
+    wire_action = review_actions.add_parser(
+        "set-wire", help="replace a net's route with an explicit polyline"
+    )
+    wire_action.add_argument("net")
+    wire_action.add_argument(
+        "points", help='polyline as "x1,y1 x2,y2 ..." in Multisim storage units'
+    )
+
+    clear_action = review_actions.add_parser(
+        "clear-warnings", help="drop analysis warnings once reviewed"
+    )
+
+    overlay_action = review_actions.add_parser("overlay", help="re-render the review overlay")
+    overlay_action.add_argument("--output", help="PNG path (default: <session>/overlay.png)")
+
+    write_action = review_actions.add_parser("build", help="write an .ms14 from the session")
+    write_action.add_argument("--netlist", required=True, help="SPICE netlist file")
+    write_action.add_argument("--output", required=True, help="destination .ms14")
+    write_action.add_argument("--net-terminals", dest="net_terminals",
+                              help="JSON file mapping net name to terminal [x, y] positions")
+    write_action.add_argument("--no-fit", dest="no_fit", action="store_true",
+                              help="do not scale the layout to clear native symbols")
+    write_action.add_argument("--no-power-symbols", dest="no_power_symbols", action="store_true",
+                              help="keep power nets as wires")
+    write_action.add_argument("--no-tree-routing", dest="no_tree_routing", action="store_true",
+                              help="route multi-drop nets to one shared point")
+
+    schematic_review.add_argument(
+        "--json", dest="json_command", action="store_true",
+        help="emit the result as JSON",
+    )
     return parser
+
+
+def _schematic_read_command(args: Any) -> dict[str, Any]:
+    """Analyse an image once and store a review session.
+
+    This is the slow half of the workflow. Keeping it separate means a caller
+    pays for image analysis exactly once and then iterates cheaply with
+    ``schematic-review``.
+    """
+    from .schematic_image.session import ReconstructionSession
+
+    session = ReconstructionSession.analyse(
+        args.image,
+        args.session,
+        dpi=args.dpi,
+        paper=args.paper,
+        page_width_mm=args.page_width_mm,
+        downscale=max(1, int(args.downscale)),
+    )
+    # Save before rendering: the overlay is an optional extra, and a failure in it
+    # must not cost the caller the analysis they just paid for.
+    session.save()
+    result: dict[str, Any] = {"session": str(session.directory), **session.summary()}
+    if args.overlay is not None:
+        try:
+            result["overlay"] = session.render(args.overlay or None).get("path")
+        except (OSError, ValueError) as exc:
+            result["overlay_error"] = str(exc)
+    return result
+
+
+def _parse_points(text: str) -> list[tuple[float, float]]:
+    """Parse ``"x1,y1 x2,y2"`` into coordinate pairs."""
+    points: list[tuple[float, float]] = []
+    for chunk in str(text).replace(";", " ").split():
+        if "," not in chunk:
+            raise ValueError(f"wire point {chunk!r} must look like x,y")
+        left, right = chunk.split(",", 1)
+        points.append((float(left), float(right)))
+    if len(points) < 2:
+        raise ValueError("a wire needs at least two points")
+    return points
+
+
+def _schematic_review_command(args: Any) -> dict[str, Any]:
+    """Apply one correction to a stored session, or report its state.
+
+    Every branch here is fast: the image is never re-read, so a caller can make
+    many small corrections and rebuild in between.
+    """
+    from .schematic_image.session import ReconstructionSession
+
+    session = ReconstructionSession.load(args.session)
+    action = getattr(args, "action", None)
+
+    if action is None or action == "summary":
+        return session.summary()
+    if action == "validate":
+        return session.validate()
+    if action == "components":
+        rows = session.components(refdes=args.refdes)
+        if args.low_confidence:
+            rows = [row for row in rows if row.get("confidence_band") == "low"]
+        if args.limit and args.limit > 0:
+            rows = rows[: args.limit]
+        return {"count": len(rows), "components": rows}
+    if action == "wires":
+        rows = []
+        for wire in session.plan.wires:
+            if args.net and wire.net != args.net:
+                continue
+            rows.append(
+                {
+                    "net": wire.net,
+                    "points": [[round(x, 2), round(y, 2)] for x, y in wire.points],
+                }
+            )
+        return {"count": len(rows), "wires": rows[: max(1, args.limit)]}
+    if action == "move":
+        session.move(args.refdes, args.x, args.y)
+    elif action == "nudge":
+        session.nudge(args.refdes, args.x, args.y)
+    elif action == "set-kind":
+        session.set_kind(args.refdes, args.kind)
+    elif action == "set-value":
+        session.set_value(args.refdes, args.value)
+    elif action == "rename":
+        session.rename(args.refdes, args.new_refdes)
+    elif action == "set-rotation":
+        session.set_rotation(args.refdes, args.degrees)
+    elif action == "delete":
+        session.delete(args.refdes)
+    elif action == "add-component":
+        session.add_component(args.refdes, args.kind, args.x, args.y, value=args.value)
+    elif action == "set-wire":
+        session.set_wire(args.net, _parse_points(args.points))
+    elif action == "clear-warnings":
+        session.clear_warnings()
+    elif action == "overlay":
+        return {"overlay": session.render(args.output).get("path")}
+    elif action == "build":
+        netlist_path = Path(args.netlist).expanduser()
+        if not netlist_path.is_file():
+            raise FileNotFoundError(f"netlist does not exist: {netlist_path}")
+        terminals = None
+        if args.net_terminals:
+            payload = json.loads(Path(args.net_terminals).expanduser().read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("--net-terminals must contain a JSON object")
+            terminals = {
+                str(name): [(float(p[0]), float(p[1])) for p in points]
+                for name, points in payload.items()
+            }
+        output = Path(args.output).expanduser()
+        if output.exists():
+            raise FileExistsError(f"refusing to overwrite existing file: {output}")
+        result = session.build(
+            netlist_path.read_text(encoding="utf-8-sig"),
+            output,
+            terminals=terminals,
+            fit_layout=not getattr(args, "no_fit", False),
+            power_symbols=not getattr(args, "no_power_symbols", False),
+            tree_routing=not getattr(args, "no_tree_routing", False),
+        )
+        session.save()
+        return result
+    else:
+        raise ValueError(f"unknown review action {action!r}")
+
+    path = session.save()
+    return {"saved": str(path), "corrections_applied": len(session.corrections)}
+
+
+def _print_schematic_read(result: dict[str, Any]) -> None:
+    """Human-readable summary of a completed analysis."""
+    kinds = ", ".join(f"{name} x{count}" for name, count in (result.get("kinds") or {}).items())
+    print(f"session        : {result.get('session')}")
+    print(f"components     : {result.get('components')}   {kinds}")
+    print(f"wires          : {result.get('wires')}")
+    print(f"junction dots  : {result.get('junctions')}")
+    print(f"unread labels  : {result.get('unread_labels')}")
+    page = result.get("page_units") or [None, None]
+    if page[0]:
+        print(f"page           : {page[0]:.0f} x {page[1]:.0f} units "
+              f"({page[0] / 96:.2f} x {page[1] / 96:.2f} inch)")
+    if result.get("overlay"):
+        print(f"overlay        : {result['overlay']}")
+    print()
+    print("next steps:")
+    for step in result.get("next_steps") or []:
+        print(f"  - {step}")
+
+
+def _print_schematic_review(action: str | None, result: dict[str, Any]) -> None:
+    """Human-readable output for one review action."""
+    if action in (None, "summary"):
+        kinds = ", ".join(f"{n} x{c}" for n, c in (result.get("kinds") or {}).items())
+        print(f"components     : {result.get('components')}   {kinds}")
+        print(f"wires          : {result.get('wires')}")
+        print(f"junctions      : {result.get('junctions')}")
+        print(f"unread labels  : {result.get('unread_labels')}")
+        print(f"corrections    : {result.get('corrections_applied')}")
+        for step in result.get("next_steps") or []:
+            print(f"  - {step}")
+        return
+    if action == "validate":
+        print("ok" if result.get("ok") else "problems found")
+        for problem in result.get("problems") or []:
+            print(f"  - {problem}")
+        return
+    if action == "components":
+        for row in result.get("components") or []:
+            print(
+                f"  {row.get('refdes') or '(unnamed)':8s} {row.get('kind'):8s} "
+                f"({row.get('x'):9.1f},{row.get('y'):9.1f})  {row.get('confidence_band')}"
+            )
+        print(f"  {result.get('count')} component(s)")
+        return
+    if action == "wires":
+        for row in result.get("wires") or []:
+            points = row.get("points") or []
+            head = " ".join(f"{x:.0f},{y:.0f}" for x, y in points[:4])
+            more = f" ... (+{len(points) - 4})" if len(points) > 4 else ""
+            print(f"  {row.get('net'):8s} {len(points):3d} pts  {head}{more}")
+        print(f"  {result.get('count')} wire(s)")
+        return
+    if "ms14" in result:
+        print(result["ms14"])
+        validation = result.get("layout_validation") or {}
+        print(f"  layout validation: {validation.get('status')}")
+        for warning in result.get("warnings") or []:
+            print(f"  warning: {warning}")
+        return
+    if "saved" in result:
+        print(f"saved ({result.get('corrections_applied')} correction(s) applied)")
+        return
+    if "overlay" in result:
+        print(result["overlay"])
+        return
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -3663,6 +4000,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(result["output_dir"])
+        return 0
+    if args.command == "schematic-read":
+        try:
+            result = _schematic_read_command(args)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            if json_output:
+                print(json.dumps({**_cli_error("schematic-read", exc)}, ensure_ascii=False))
+            else:
+                parser.error(str(exc))
+            return 2
+        if json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            _print_schematic_read(result)
+        return 0
+    if args.command == "schematic-review":
+        try:
+            result = _schematic_review_command(args)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            if json_output:
+                print(json.dumps({**_cli_error("schematic-review", exc)}, ensure_ascii=False))
+            else:
+                parser.error(str(exc))
+            return 2
+        if json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            _print_schematic_review(getattr(args, "action", None), result)
         return 0
     if args.command == "configure":
         try:

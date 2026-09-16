@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
-from .glyphs import SYM_UNKNOWN, SYMBOL_PREFIX, Symbol
+from .glyphs import SYM_TEXT, SYM_UNKNOWN, SYMBOL_PREFIX, Symbol
 from .palette import ROLE_WIRE
 from .raster import Calibration, RoleIndex
 from .text import TextRegion
@@ -406,6 +406,34 @@ def px_to_units(calibration: Calibration, value: float) -> float:
     return calibration.px_to_units(value)
 
 
+def orthogonalise(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Force a polyline to be axis-aligned, introducing corners where needed.
+
+    A schematic wire is rectilinear, so a diagonal segment cannot be built. One
+    can still appear here: polyline endpoints come from detected junction dots
+    and wire crossings, whose centres are measured to sub-pixel accuracy, and a
+    path that is straight in the image can therefore have ends that differ in
+    both coordinates by a fraction of a unit.
+
+    The fix is to insert an L corner rather than to drop the segment, so the
+    route stays where it was measured instead of being silently truncated.
+    """
+    if len(points) < 2:
+        return list(points)
+    out: list[tuple[float, float]] = [points[0]]
+    for point in points[1:]:
+        previous = out[-1]
+        if abs(previous[0] - point[0]) > 1e-9 and abs(previous[1] - point[1]) > 1e-9:
+            # Travel along x first, which keeps a mostly-horizontal run on its
+            # own row for as long as possible.
+            if abs(point[0] - previous[0]) >= abs(point[1] - previous[1]):
+                out.append((point[0], previous[1]))
+            else:
+                out.append((previous[0], point[1]))
+        out.append(point)
+    return out
+
+
 def simplify_rectilinear(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
     """Drop collinear intermediate points from an axis-aligned polyline."""
     if len(points) <= 2:
@@ -504,9 +532,15 @@ def build_plan(
         # what the part is; symbol shape is a fallback that also cross-checks it.
         shape_kind = kind_overrides.get(symbol.symbol) or SYMBOL_TO_KIND.get(symbol.symbol)
         refdes_kind = kind_from_refdes(refdes)
+        # "unknown" and "block" both fall back to the generic carrier kind, so
+        # comparing kinds alone would report a match for a part whose artwork was
+        # never identified. Agreement therefore requires that the artwork itself
+        # was recognised.
+        artwork_identified = symbol.symbol not in {SYM_UNKNOWN, SYM_TEXT, ""}
+        agreement = bool(refdes_kind) and artwork_identified and shape_kind == refdes_kind
         if refdes_kind is not None:
             kind = refdes_kind
-            if shape_kind is not None and shape_kind != refdes_kind:
+            if artwork_identified and shape_kind is not None and shape_kind != refdes_kind:
                 plan.warnings.append(
                     f"{refdes}: symbol artwork suggests {shape_kind} but the reference "
                     f"designator implies {refdes_kind}; using {refdes_kind}"
@@ -515,11 +549,18 @@ def build_plan(
             kind = shape_kind
         else:
             kind = "XSUB4"
+
+        # Confidence must reflect the WEAKEST link, not the strongest. A readable
+        # designator says what the part is, but when its artwork was never
+        # identified then only its position is certain, and reporting that as high
+        # confidence hides it from review -- which is exactly what happened before
+        # this distinction was made: all 30 components reported "high" and the
+        # review queue was empty.
         confidence = symbol.confidence
-        if refdes_kind is not None:
-            # A readable designator is strong evidence, so it lifts the reported
-            # confidence even when the artwork was ambiguous.
-            confidence = max(confidence, 0.9 if shape_kind == refdes_kind else 0.7)
+        if agreement:
+            confidence = max(confidence, 0.9)
+        elif refdes_kind is not None and not artwork_identified:
+            confidence = min(confidence, 0.5)
         if symbol.symbol == SYM_UNKNOWN and refdes_kind is None:
             plan.warnings.append(
                 f"{refdes} at pixel {symbol.bbox} could not be classified; "
@@ -548,8 +589,13 @@ def build_plan(
 
     if graph is not None:
         for number, chain in enumerate(graph.polylines(), start=1):
+            # Orthogonalise before simplifying: a recovered chain can carry a
+            # sub-unit diagonal between two measured endpoints, and a diagonal
+            # cannot be built. Doing it in this order means the L corner that
+            # fixes the diagonal can then be recognised as collinear and dropped
+            # where it is redundant.
             points = simplify_rectilinear(
-                polyline_px_to_units(chain, calibration, grid=grid_units)
+                orthogonalise(polyline_px_to_units(chain, calibration, grid=grid_units))
             )
             if len(points) < 2:
                 continue
