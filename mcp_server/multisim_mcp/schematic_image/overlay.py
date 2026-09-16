@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from .plan import ReconstructionPlan
 from .raster import Calibration
+from .units import MIL_PER_UNIT, MIN_NATIVE_PITCH_UNITS
 
 # Overlay colours (RGB).
 COLOR_WIRE = (255, 0, 0)
@@ -66,6 +67,26 @@ class OverlayResult:
         }
 
 
+def _component_box(
+    component: Any,
+    *,
+    units_to_canvas: float,
+    marker: float,
+) -> tuple[float, float, float, float]:
+    """Return the canvas rectangle for one component.
+
+    The box is drawn from the component's *position*, converted through the same
+    unit chain as the wires, so it always lands where the schematic builder will
+    actually place the part.  A recovered ``bbox_px`` is deliberately not used:
+    it is the designator text box, which sits beside the part and would make the
+    overlay look as though components were in the wrong places.
+    """
+    cx = float(component.x) * units_to_canvas
+    cy = float(component.y) * units_to_canvas
+    half = marker / 2.0
+    return (cx - half, cy - half, cx + half, cy + half)
+
+
 def render_overlay(
     image_path: str | Path,
     plan: ReconstructionPlan,
@@ -115,11 +136,14 @@ def render_overlay(
     px_per_mil = plan.calibration.get("px_per_mil")
     if not px_per_mil:
         raise OverlayError("plan.calibration is missing px_per_mil")
-    # Plan coordinates are in mils and were derived from the analysis array,
-    # which may be a reduced copy of the source.  Both factors are needed: mils
-    # -> analysis pixels -> source pixels -> this canvas.
+    # Plan coordinates are in Multisim storage units (1/96 inch), while the
+    # calibration reports pixels per MIL.  Both steps matter:
+    #   unit -> mil        (x MIL_PER_UNIT)
+    #   mil  -> source px  (x px_per_mil, which describes the ORIGINAL export)
+    # Using px_per_mil alone misplaces every object by a factor of 10.4.
     analysis_scale = float(plan.calibration.get("analysis_scale") or 1.0)
-    factor = float(px_per_mil) * analysis_scale * scale
+    px_per_unit = float(px_per_mil) * MIL_PER_UNIT
+    factor = px_per_unit * scale
 
     drawn = {"wires": 0, "junctions": 0, "components": 0, "texts": 0, "labels": 0}
 
@@ -138,47 +162,37 @@ def render_overlay(
         draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=COLOR_JUNCTION)
         drawn["junctions"] += 1
 
-    # --- components, using the original pixel bounding boxes when available
-    box_scale = analysis_scale * scale
+    # --- components.  Drawn from their position through the same unit chain as
+    # the wires, so the box marks where the schematic builder will place the
+    # part.  The recovered bbox_px is the designator text box and is not used.
+    marker = max(8.0, 0.9 * MIN_NATIVE_PITCH_UNITS * factor)
     for component in plan.components:
-        if len(component.bbox_px) == 4:
-            x0, y0, x1, y1 = component.bbox_px
-            box = (x0 * box_scale, y0 * box_scale, x1 * box_scale, y1 * box_scale)
-            # A click-sized box is unhelpful, so give it a minimum extent.
-            if box[2] - box[0] < 10 or box[3] - box[1] < 10:
-                centre_x, centre_y = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-                half = 9.0
-                box = (centre_x - half, centre_y - half, centre_x + half, centre_y + half)
-        else:
-            cx, cy = component.x * factor, component.y * factor
-            half = 63 * factor
-            box = (cx - half, cy - half, cx + half, cy + half)
+        box = _component_box(component, units_to_canvas=factor, marker=marker)
         draw.rectangle(box, outline=COLOR_COMPONENT, width=2)
         drawn["components"] += 1
         if draw_text and component.refdes:
             draw.text((box[0] + 2, max(0, box[1] - 12)), component.refdes, fill=COLOR_COMPONENT)
 
-    # --- unread label regions, so omissions are visible rather than invisible
-    for text in plan.texts:
-        if not text.text.startswith("<unread"):
-            continue
-        px, py = text.x * factor, text.y * factor
-        draw.line((px - 6, py, px + 6, py), fill=COLOR_MISS, width=2)
-        draw.line((px, py - 6, px, py + 6), fill=COLOR_MISS, width=2)
-        drawn["texts"] += 1
-
-    # --- label regions the analysis located, drawn as their true rectangles
+    # --- labels the analysis located but could not read.  Drawn as their true
+    # rectangles, in the label colour, rather than as free-standing markers: a
+    # marker at a text centre lands on a gap between glyphs and reads as noise.
+    # A rectangle shows a reviewer exactly which text still needs transcribing.
+    # ``region.bbox`` is in ANALYSIS pixels, hence the analysis-to-source ratio.
+    box_scale = analysis_scale * scale
     for region in plan.regions:
         box = region.get("bbox")
         if not (isinstance(box, list) and len(box) == 4):
             continue
         x0, y0, x1, y1 = box
+        read = bool(str(region.get("text") or "").strip())
         draw.rectangle(
             (x0 * box_scale, y0 * box_scale, x1 * box_scale, y1 * box_scale),
-            outline=COLOR_LABEL,
+            outline=COLOR_LABEL if read else COLOR_MISS,
             width=1,
         )
         drawn["labels"] += 1
+        if not read:
+            drawn["texts"] += 1
 
     canvas.save(destination, format="PNG")
     return OverlayResult(

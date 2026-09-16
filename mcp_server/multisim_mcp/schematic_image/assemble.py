@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .plan import ReconstructionPlan, plan_to_wires
+from .power import plan_power_symbols
+from .tree import route_nets
+from .fit import fit_and_relax
 
 
 class AssemblyError(ValueError):
@@ -65,6 +68,14 @@ class BuildRequest:
     unassigned_paths: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
+    #: Page size in storage units, after any scale fit.
+    page: tuple[float, float] | None = None
+    #: How much the layout had to be scaled to clear native symbols.
+    fit: Any = None
+    #: Local ground/supply symbols that replace long power runs.
+    power: Any = None
+    #: MST-based trees for multi-drop signal nets.
+    trees: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +87,10 @@ class BuildRequest:
             },
             "assignments": [item.to_dict() for item in self.assignments],
             "unassigned_paths": list(self.unassigned_paths),
+            "page": [round(self.page[0], 3), round(self.page[1], 3)] if self.page else None,
+            "fit": self.fit.to_dict() if self.fit is not None else None,
+            "power": self.power.to_dict() if self.power is not None else None,
+            "trees": {net: tree.to_dict() for net, tree in sorted(self.trees.items())},
             "warnings": list(self.warnings),
             "stats": dict(self.stats),
         }
@@ -195,14 +210,42 @@ def build_request_from_plan(
     terminals: dict[str, list[tuple[float, float]]] | None = None,
     tolerance: float | None = None,
     grid_mil: float | None = None,
+    fit_layout: bool = True,
+    clearance: float = 1.15,
+    power_symbols: bool = True,
+    tree_routing: bool = True,
+    min_tree_terminals: int = 3,
 ) -> BuildRequest:
     """Turn a reconstruction plan into an explicit-layout build request.
 
-    ``terminals`` maps a net name to the drawing positions of the component
-    pins on that net.  Supplying it lets recovered wires be attached to the
-    right net; omitting it still reproduces every component position, and the
-    wires are then left to the builder's router.
+    ``terminals`` maps a net name to the drawing positions of the component pins
+    on that net. Supplying it lets recovered wires be attached to the right net;
+    omitting it still reproduces every component position, and the wiring is then
+    left to the builder's router.
+
+    Three post-processing steps make the result look like a schematic rather than
+    a coordinate dump, and each can be switched off:
+
+    ``fit_layout``
+        A native Multisim symbol has a fixed size -- a resistor's pins are 45
+        storage units apart -- while a drawing from another tool may space its
+        parts much closer. Coordinates are scaled by one global factor so no two
+        symbols overlap, and the sheet grows with them. Relative layout and
+        aspect ratio are preserved exactly.
+    ``power_symbols``
+        Ground and supply nets are not run as wires. Each terminal gets a local
+        symbol beside it, which is how a real drawing avoids a ground line
+        crossing the whole sheet.
+    ``tree_routing``
+        A net with three or more drops is realised as a rectilinear minimum
+        spanning tree with L-shaped branches, rather than a star of wires all
+        meeting at one point.
     """
+    if tolerance is not None and tolerance <= 0:
+        raise AssemblyError("tolerance must be positive")
+    if clearance < 1.0:
+        raise AssemblyError("clearance must be at least 1")
+
     request = BuildRequest()
     grid = float(grid_mil if grid_mil is not None else plan.page.get("grid", 9.0))
     if grid <= 0:
@@ -212,6 +255,29 @@ def build_request_from_plan(
         request.positions[component.refdes] = (component.x, component.y)
     request.stats["components"] = len(request.positions)
 
+    page = None
+    width = plan.page.get("width")
+    height = plan.page.get("height")
+    if isinstance(width, (int, float)) and isinstance(height, (int, float)) and width > 0 and height > 0:
+        page = (float(width), float(height))
+
+    # --- 1. Fit the measured layout onto native symbol geometry.
+    if fit_layout and len(request.positions) >= 2:
+        fit = fit_and_relax(
+            request.positions,
+            page=page,
+            clearance=clearance,
+            relax=True,
+        )
+        request.positions = fit.positions
+        request.page = fit.page
+        request.fit = fit
+        request.warnings.extend(fit.warnings)
+        request.stats["layout_scale"] = round(fit.scale, 4)
+        request.stats["min_gap_units"] = round(fit.min_gap_after, 3)
+    elif page is not None:
+        request.page = page
+
     paths_by_net = plan_to_wires(plan)
     flat: list[list[tuple[float, float]]] = []
     for net in sorted(paths_by_net):
@@ -219,10 +285,21 @@ def build_request_from_plan(
             flat.append(list(path))
     request.stats["recovered_paths"] = len(flat)
 
+    # Any scaling applied to positions must apply to the recovered geometry too,
+    # or the wires would no longer meet the pins they belong to.
+    scale = float(request.stats.get("layout_scale", 1.0))
+    if scale != 1.0 and flat:
+        flat = [[(x * scale, y * scale) for x, y in path] for path in flat]
+        if terminals:
+            terminals = {
+                name: [(x * scale, y * scale) for x, y in points]
+                for name, points in terminals.items()
+            }
+
     if terminals and flat:
         # A wire connects pins, so a sensible tolerance is a few grid pitches:
         # the recovered centre-line is accurate to about one stroke width.
-        reach = tolerance if tolerance is not None else max(2.0 * grid, 18.0)
+        reach = tolerance if tolerance is not None else max(2.0 * grid * max(1.0, scale), 18.0)
         assignments, unassigned, warnings = assign_paths_to_nets(
             flat, terminals, tolerance=reach
         )
@@ -244,8 +321,46 @@ def build_request_from_plan(
             "attached to nets; component positions are still reproduced exactly"
         )
 
-    if tolerance is not None and tolerance <= 0:
-        raise AssemblyError("tolerance must be positive")
+    # --- 2. Local power symbols instead of long power runs.
+    if power_symbols and terminals:
+        power = plan_power_symbols(
+            {name: [tuple(point) for point in points] for name, points in terminals.items()}
+        )
+        request.power = power
+        request.warnings.extend(power.warnings)
+        request.stats["power_symbols"] = power.stats.get("symbols", 0)
+        # A power net drawn with local symbols needs no long route.
+        for item in power.symbols:
+            request.routes.pop(item.net, None)
+
+    # --- 3. Multi-drop signal nets become rectilinear trees.
+    if tree_routing and terminals:
+        candidates = {
+            name: [tuple(point) for point in points]
+            for name, points in terminals.items()
+            if len(points) >= min_tree_terminals
+        }
+        if request.power is not None:
+            # Power nets are handled by symbols, not trees.
+            for item in request.power.symbols:
+                candidates.pop(item.net, None)
+        trees = route_nets(candidates, min_terminals=min_tree_terminals)
+        request.trees = trees
+        for net, tree in trees.items():
+            if net in request.routes:
+                # A measured route is more faithful than a computed tree, so it
+                # wins; the tree is still reported for comparison.
+                continue
+        if trees:
+            saved = [tree for tree in trees.values() if tree.star_length > 0]
+            if saved:
+                average = sum(tree.saving_ratio for tree in saved) / len(saved)
+                request.stats["tree_nets"] = len(trees)
+                request.stats["tree_length_vs_star"] = round(average, 4)
+                request.warnings.append(
+                    f"{len(trees)} multi-drop net(s) routed as rectilinear trees; "
+                    f"total wire length is {average:.0%} of the previous star routing"
+                )
     return request
 
 

@@ -21,6 +21,11 @@ from .glyphs import SYM_UNKNOWN, SYMBOL_PREFIX, Symbol
 from .palette import ROLE_WIRE
 from .raster import Calibration, RoleIndex
 from .text import TextRegion
+from .units import (
+    MIL_PER_UNIT,
+    UNITS_PER_INCH,
+    mil_to_units,
+)
 from .vector import Junction, Point, WireGraph
 
 #: Multisim's default schematic grid, in mils.
@@ -371,12 +376,14 @@ def assign_refdes(
     return assigned
 
 
-def polyline_px_to_mil(points: Iterable[Point], calibration: Calibration, *, grid: float) -> list[tuple[float, float]]:
-    """Convert a raster polyline to snapped drawing units."""
+def polyline_px_to_units(
+    points: Iterable[Point], calibration: Calibration, *, grid: float
+) -> list[tuple[float, float]]:
+    """Convert a raster polyline to snapped Multisim storage units."""
     converted = [
         (
-            snap(calibration.px_to_mil(x), grid),
-            snap(calibration.px_to_mil(y), grid),
+            snap(px_to_units(calibration, x), grid),
+            snap(px_to_units(calibration, y), grid),
         )
         for x, y in points
     ]
@@ -386,6 +393,15 @@ def polyline_px_to_mil(points: Iterable[Point], calibration: Calibration, *, gri
         if not cleaned or cleaned[-1] != point:
             cleaned.append(point)
     return cleaned
+
+
+def px_to_units(calibration: Calibration, value: float) -> float:
+    """Convert one raster pixel coordinate to Multisim storage units.
+
+    The chain is pixels -> mil (from the image's own scale) -> storage units. The
+    second step is the one that is easy to forget and expensive to get wrong.
+    """
+    return mil_to_units(calibration.px_to_mil(value))
 
 
 def simplify_rectilinear(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -421,7 +437,14 @@ def build_plan(
     grid_mil: float = DEFAULT_GRID_MIL,
     image_size_px: tuple[int, int] | None = None,
 ) -> ReconstructionPlan:
-    """Assemble a :class:`ReconstructionPlan` from the analysis stages."""
+    """Assemble a :class:`ReconstructionPlan` from the analysis stages.
+
+    Every coordinate in the result is in Multisim storage units (1/96 inch).
+    ``grid_mil`` states the schematic grid in mil for convenience and is
+    converted once; callers reasoning in mil should read the ``*_mil`` page
+    fields rather than doing their own conversion.
+    """
+    grid_units = mil_to_units(grid_mil)
     kind_overrides = kind_overrides or {}
     refdes_overrides = {key.upper(): val for key, val in (refdes_overrides or {}).items()}
     position_overrides = position_overrides or {}
@@ -433,13 +456,25 @@ def build_plan(
         if override:
             refdes_by_index[index] = override
 
+    # The plan is expressed in Multisim STORAGE UNITS (1/96 inch), not mil. The
+    # conversion happens once, here, so nothing downstream has to remember it;
+    # writing mil straight into the file inflated drawings by a factor of 10.4.
+    width_units = mil_to_units(
+        calibration.px_to_mil((image_size_px or calibration.analysis_size_px)[0])
+    )
+    height_units = mil_to_units(
+        calibration.px_to_mil((image_size_px or calibration.analysis_size_px)[1])
+    )
     plan = ReconstructionPlan(
         page={
-            "units": "mil",
-            "mil_per_unit": 1.0,
-            "width": round(calibration.px_to_mil((image_size_px or calibration.analysis_size_px)[0]), 3),
-            "height": round(calibration.px_to_mil((image_size_px or calibration.analysis_size_px)[1]), 3),
-            "grid": grid_mil,
+            "units": "multisim-unit",
+            "units_per_inch": UNITS_PER_INCH,
+            "mil_per_unit": MIL_PER_UNIT,
+            "width": round(width_units, 3),
+            "height": round(height_units, 3),
+            "width_mil": round(width_units * MIL_PER_UNIT, 3),
+            "height_mil": round(height_units * MIL_PER_UNIT, 3),
+            "grid": grid_units,
             "paper": calibration.paper,
             "page_mm": [round(calibration.page_mm[0], 2), round(calibration.page_mm[1], 2)],
         },
@@ -488,15 +523,15 @@ def build_plan(
                 "review the symbol and set kind explicitly"
             )
         cx, cy = symbol.centre
-        x, y = calibration.px_to_mil(cx), calibration.px_to_mil(cy)
+        x, y = px_to_units(calibration, cx), px_to_units(calibration, cy)
         override = position_overrides.get(refdes)
         plan.components.append(
             PlannedComponent(
                 refdes=refdes,
                 kind=kind,
                 symbol=symbol.symbol,
-                x=snap(override[0] if override else x, grid_mil),
-                y=snap(override[1] if override else y, grid_mil),
+                x=snap(override[0] if override else x, grid_units),
+                y=snap(override[1] if override else y, grid_units),
                 rotation=0 if override else _rotation_for(symbol),
                 value=values.get(index, ""),
                 confidence=confidence,
@@ -510,7 +545,9 @@ def build_plan(
 
     if graph is not None:
         for number, chain in enumerate(graph.polylines(), start=1):
-            points = simplify_rectilinear(polyline_px_to_mil(chain, calibration, grid=grid_mil))
+            points = simplify_rectilinear(
+                polyline_px_to_units(chain, calibration, grid=grid_units)
+            )
             if len(points) < 2:
                 continue
             plan.wires.append(PlannedWire(net=f"{wire_net_prefix}{number}", points=points))
@@ -518,8 +555,8 @@ def build_plan(
     for dot in junctions:
         plan.junctions.append(
             (
-                snap(calibration.px_to_mil(dot.x), grid_mil),
-                snap(calibration.px_to_mil(dot.y), grid_mil),
+                snap(px_to_units(calibration, dot.x), grid_units),
+                snap(px_to_units(calibration, dot.y), grid_units),
             )
         )
 
@@ -531,8 +568,8 @@ def build_plan(
             plan.texts.append(
                 PlannedText(
                     text=region.text or f"<unread {region.kind} label>",
-                    x=snap(calibration.px_to_mil(region.centre[0]), grid_mil),
-                    y=snap(calibration.px_to_mil(region.centre[1]), grid_mil),
+                    x=snap(px_to_units(calibration, region.centre[0]), grid_units),
+                    y=snap(px_to_units(calibration, region.centre[1]), grid_units),
                     role=region.kind,
                 )
             )

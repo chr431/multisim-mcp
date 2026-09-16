@@ -27,7 +27,13 @@ from .text import TextRegion, extract_text_regions
 
 @dataclass
 class ComponentAnchor:
-    """One reference-designator label and the artwork it names."""
+    """One reference-designator label and the artwork it names.
+
+    ``bbox_px`` is the designator *text* box, which is what was located. The
+    ``symbol_bbox_px`` is the extent of the matched artwork and is the box a
+    reviewer wants drawn; when no artwork matched, it is derived from the native
+    footprint so the overlay still shows where the part sits.
+    """
 
     refdes: str
     x: float
@@ -41,12 +47,32 @@ class ComponentAnchor:
     def symbol_name(self) -> str:
         return self.symbol.symbol if self.symbol is not None else "unknown"
 
+    @property
+    def symbol_bbox_px(self) -> tuple[int, int, int, int]:
+        """Bounding box of the matched artwork, or a footprint-sized box."""
+        if self.symbol is not None and self.symbol.primitives:
+            return self.symbol.bbox
+        # No artwork: fall back to the native minimum footprint around the
+        # anchor so a caller is not handed a zero-sized box.
+        half = self.footprint_px / 2.0
+        return (
+            int(round(self.x - half)),
+            int(round(self.y - half)),
+            int(round(self.x + half)),
+            int(round(self.y + half)),
+        )
+
+    #: Half-width of the fallback box, in pixels, set by the caller that knows
+    #: the drawing scale. Defaults to a size that is visible on any export.
+    footprint_px: float = 18.0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "refdes": self.refdes,
             "x": round(self.x, 2),
             "y": round(self.y, 2),
             "bbox_px": list(self.bbox_px),
+            "symbol_bbox_px": list(self.symbol_bbox_px),
             "symbol": self.symbol_name,
             "symbol_distance_px": (
                 round(self.symbol_distance, 2) if self.symbol_distance != float("inf") else None

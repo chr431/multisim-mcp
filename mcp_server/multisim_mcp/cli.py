@@ -3178,6 +3178,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON file mapping net name to its terminal [x, y] positions",
     )
     schematic_build.add_argument(
+        "--no-fit",
+        dest="no_fit",
+        action="store_true",
+        help="do not scale the layout to clear native symbol geometry",
+    )
+    schematic_build.add_argument(
+        "--no-power-symbols",
+        dest="no_power_symbols",
+        action="store_true",
+        help="keep power nets as wires instead of placing local symbols",
+    )
+    schematic_build.add_argument(
+        "--no-tree-routing",
+        dest="no_tree_routing",
+        action="store_true",
+        help="route multi-drop nets to one shared point instead of as a tree",
+    )
+    schematic_build.add_argument(
         "--json",
         dest="json_command",
         action="store_true",
@@ -3294,7 +3312,13 @@ def _schematic_build_command(args: Any) -> dict[str, Any]:
             for name, points in raw.items()
         }
 
-    request = build_request_from_plan(plan, terminals=terminals)
+    request = build_request_from_plan(
+        plan,
+        terminals=terminals,
+        fit_layout=not getattr(args, "no_fit", False),
+        power_symbols=not getattr(args, "no_power_symbols", False),
+        tree_routing=not getattr(args, "no_tree_routing", False),
+    )
 
     output = Path(args.output).expanduser()
     if output.suffix.lower() != ".ms14":
@@ -3311,6 +3335,8 @@ def _schematic_build_command(args: Any) -> dict[str, Any]:
         probe_nets=[],
         explicit_positions=request.positions,
         explicit_routes=request.routes,
+        power_symbols=not getattr(args, "no_power_symbols", False),
+        tree_routing=not getattr(args, "no_tree_routing", False),
     )
     from .multisim_client import Ms14Codec
 

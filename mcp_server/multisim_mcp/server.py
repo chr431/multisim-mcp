@@ -2702,6 +2702,9 @@ def build_schematic_from_plan(
     plan: dict[str, Any],
     output_ms14: str,
     net_terminals: dict[str, list[list[float]]] | None = None,
+    fit_layout: bool = True,
+    power_symbols: bool = True,
+    tree_routing: bool = True,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Write an .ms14 that reproduces a picture's layout for a given netlist.
@@ -2715,6 +2718,25 @@ def build_schematic_from_plan(
     right nets; without it the component positions are still exact and the
     wiring is autorouted. Nets whose recovered wire cannot be matched are listed
     in ``assignment.warnings`` rather than connected on a guess.
+
+    Three options turn a coordinate transplant into something that reads like a
+    schematic, and each defaults to on:
+
+    ``fit_layout``
+        A native Multisim symbol has a fixed size -- a resistor's pins are 45
+        storage units apart -- so a drawing from another tool whose parts sit
+        closer together would overlap itself. Positions are scaled by one global
+        factor until symbols clear each other, and the sheet grows with them;
+        relative layout and aspect ratio are preserved. The factor and the
+        resulting minimum spacing are reported in ``assignment.fit``.
+    ``power_symbols``
+        Ground nets are not run as wires. Each grounded part gets a local ground
+        symbol beside it, which is how a hand-drawn schematic avoids a ground
+        line crossing the whole sheet.
+    ``tree_routing``
+        A net with three or more drops becomes a rectilinear minimum spanning
+        tree with L-shaped branches rather than a star of wires meeting at one
+        point.
 
     This does not start Multisim and does not open the file; it writes the
     ``.ms14`` and its source XML. Set ``overwrite`` to replace existing files.
@@ -2740,7 +2762,13 @@ def build_schematic_from_plan(
                 cleaned.append((float(point[0]), float(point[1])))
             terminals[str(name)] = cleaned
 
-    request = build_request_from_plan(parsed, terminals=terminals)
+    request = build_request_from_plan(
+        parsed,
+        terminals=terminals,
+        fit_layout=bool(fit_layout),
+        power_symbols=bool(power_symbols),
+        tree_routing=bool(tree_routing),
+    )
 
     output = Path(output_ms14).expanduser()
     if output.suffix.lower() != ".ms14":
@@ -2757,6 +2785,8 @@ def build_schematic_from_plan(
         probe_nets=[],
         explicit_positions=request.positions,
         explicit_routes=request.routes,
+        power_symbols=bool(power_symbols),
+        tree_routing=bool(tree_routing),
     )
     encoded = codec.encode(str(xml_path), str(output))
     return {
